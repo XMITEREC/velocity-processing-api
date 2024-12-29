@@ -11,14 +11,14 @@ from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from math import sqrt
-import joblib  # For saving/loading model
+import joblib  # For saving/loading the model
 
 app = Flask(__name__)
 
 MODEL_FILENAME = "model.pkl"
 
 # ========================================
-# 1) Try loading a previously saved model
+# 1) Attempt to load previously saved model
 # ========================================
 saved_model = None
 if os.path.exists(MODEL_FILENAME):
@@ -34,6 +34,10 @@ if os.path.exists(MODEL_FILENAME):
 # A) HELPER FUNCTIONS
 # ========================================
 def preprocess_acceleration_to_velocity(df, time_col='time', ax_col='ax (m/s^2)', ay_col='ay (m/s^2)', az_col='az (m/s^2)'):
+    """
+    Integrates acceleration into velocity,
+    removing spikes via rolling mean thresholds.
+    """
     df['ax_rolling_mean'] = df[ax_col].rolling(window=5, center=True).mean()
     df['ay_rolling_mean'] = df[ay_col].rolling(window=5, center=True).mean()
     df['az_rolling_mean'] = df[az_col].rolling(window=5, center=True).mean()
@@ -57,11 +61,12 @@ def preprocess_acceleration_to_velocity(df, time_col='time', ax_col='ax (m/s^2)'
 
     df['time_diff'] = df[time_col].diff().fillna(0)
     velocity = [0]
+
     for i in range(1, len(df)):
         ax, ay, az = df.loc[i, [ax_col, ay_col, az_col]]
         time_diff = df.loc[i, 'time_diff']
 
-        # Choose "dominant axis" or combined magnitude
+        # Pick the dominant axis or total magnitude
         if abs(ax) > abs(ay) and abs(ax) > abs(az):
             accel = ax
         elif abs(ay) > abs(ax) and abs(ay) > abs(az):
@@ -78,6 +83,10 @@ def preprocess_acceleration_to_velocity(df, time_col='time', ax_col='ax (m/s^2)'
 
 
 def preprocess_true_velocity(df_true, df_accel, time_col='time', speed_col='speed'):
+    """
+    Expand the 'true velocity' dataset to match the row count of df_accel,
+    randomly interpolating speeds between rows.
+    """
     df_true = df_true[[time_col, speed_col]]
     n1 = len(df_accel)
     n2 = len(df_true)
@@ -97,7 +106,7 @@ def preprocess_true_velocity(df_true, df_accel, time_col='time', speed_col='spee
             new_speed = np.random.uniform(low_val, high_val)
             expanded_speeds.append(new_speed)
 
-    # Handle remainder
+    # Fill the remainder if needed
     current_length = len(expanded_speeds)
     remainder = n1 - current_length
     if remainder > 0:
@@ -122,16 +131,12 @@ def preprocess_true_velocity(df_true, df_accel, time_col='time', speed_col='spee
 # ========================================
 def process_data(accel_df, true_df):
     # 1) Integrate acceleration
-    accel_df = preprocess_acceleration_to_velocity(
-        accel_df, time_col='time'
-    )
+    accel_df = preprocess_acceleration_to_velocity(accel_df)
 
     # 2) Expand true velocity
-    true_df_expanded = preprocess_true_velocity(
-        df_true=true_df, df_accel=accel_df, time_col='time'
-    )
+    true_df_expanded = preprocess_true_velocity(true_df, accel_df)
 
-    # 3) Create combined DataFrame
+    # 3) Merge into a single DataFrame
     time_col = 'time'
     calc_v_col = 'velocity'
     true_v_col = 'true_velocity'
@@ -141,7 +146,7 @@ def process_data(accel_df, true_df):
     df[true_v_col] = true_df_expanded[true_v_col]
     df['correction'] = df[true_v_col] - df[calc_v_col]
 
-    # 4) Train model
+    # 4) Train a random forest
     X = df[[time_col, calc_v_col]].values
     y = df['correction'].values
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -153,7 +158,7 @@ def process_data(accel_df, true_df):
     mae_test = mean_absolute_error(y_test, y_pred_test)
     rmse_test = np.sqrt(mean_squared_error(y_test, y_pred_test))
 
-    # 6) Predict corrections for full data
+    # 6) Predict on full data
     df['predicted_correction'] = model.predict(X)
     df['corrected_velocity'] = df[calc_v_col] + df['predicted_correction']
 
@@ -173,7 +178,7 @@ def process_data(accel_df, true_df):
         joblib.dump(model, MODEL_FILENAME)
         print(f"Model saved to {MODEL_FILENAME} because IoU ≥ 95%.")
 
-    # 10) Create plot
+    # 10) Create a comparison plot
     plt.figure(figsize=(10, 6))
     plt.plot(df[time_col], df[true_v_col], label='True Velocity', linestyle='--')
     plt.plot(df[time_col], df[calc_v_col], label='Calculated Velocity')
@@ -188,7 +193,7 @@ def process_data(accel_df, true_df):
     image_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
     plt.close()
 
-    # 11) Test-subset average velocities
+    # 11) Test subset stats
     test_times = X_test[:, 0]
     test_df = df[df[time_col].isin(test_times)]
     avg_corrected = test_df['corrected_velocity'].mean()
@@ -214,39 +219,14 @@ def process_data(accel_df, true_df):
 
 
 # ========================================
-# C) INFERENCE-ONLY FUNCTION
-# ========================================
-def predict_corrected_velocity_only(accel_df, loaded_model):
-    # 1) Integrate acceleration
-    accel_df = preprocess_acceleration_to_velocity(accel_df)
-
-    # 2) Use model to predict correction
-    time_col = 'time'
-    calc_v_col = 'velocity'
-    X = accel_df[[time_col, calc_v_col]].values
-    predicted_correction = loaded_model.predict(X)
-    corrected_velocity = accel_df[calc_v_col] + predicted_correction
-
-    # Return as DataFrame so we can convert to JSON or display
-    results_df = pd.DataFrame({
-        'time': accel_df[time_col],
-        'calculated_velocity': accel_df[calc_v_col],
-        'predicted_correction': predicted_correction,
-        'corrected_velocity': corrected_velocity
-    })
-    return results_df
-
-
-# ========================================
-# D) ROUTES
+# C) ROUTES
 # ========================================
 
 @app.route('/process', methods=['POST'])
 def process_endpoint():
     """
-    1) Upload acceleration_file + true_velocity_file
-    2) Train model, compute IoU, optionally save if >=95%
-    3) Return JSON with metrics + base64 plot
+    Train the model with acceleration + true velocity, compute IoU, optionally save model.
+    Returns metrics + base64 plot.
     """
     if 'acceleration_file' not in request.files or 'true_velocity_file' not in request.files:
         return jsonify({"error": "Please provide both 'acceleration_file' and 'true_velocity_file'"}), 400
@@ -261,7 +241,6 @@ def process_endpoint():
         accel_df = pd.read_csv(io.StringIO(accel_file.stream.read().decode("UTF8")), low_memory=False)
         true_df = pd.read_csv(io.StringIO(true_file.stream.read().decode("UTF8")), low_memory=False)
 
-        # Make columns lowercase
         accel_df.columns = accel_df.columns.str.lower()
         true_df.columns = true_df.columns.str.lower()
 
@@ -285,9 +264,8 @@ def process_endpoint():
 @app.route('/predict', methods=['POST'])
 def predict_endpoint():
     """
-    1) Upload only acceleration_file
-    2) Use previously saved model (if exists) to predict corrected velocity
-    3) Return the predictions as JSON (no plot by default)
+    Use the saved model (if available) to predict corrected velocity from acceleration only.
+    Returns only the AVERAGE corrected velocity.
     """
     global saved_model
     if 'acceleration_file' not in request.files:
@@ -298,13 +276,14 @@ def predict_endpoint():
         return jsonify({"error": "No selected file"}), 400
 
     try:
-        # If not loaded yet, attempt to load from disk
+        # Try loading the model if not already loaded
         if not saved_model and os.path.exists(MODEL_FILENAME):
             saved_model = joblib.load(MODEL_FILENAME)
 
         if not saved_model:
             return jsonify({"error": "No saved model found. Please train first (IoU≥95%)."}), 400
 
+        # Read acceleration
         accel_df = pd.read_csv(io.StringIO(accel_file.stream.read().decode("UTF8")), low_memory=False)
         accel_df.columns = accel_df.columns.str.lower()
 
@@ -313,12 +292,22 @@ def predict_endpoint():
         if missing_accel:
             return jsonify({"error": f"Missing columns in acceleration dataset: {missing_accel}"}), 400
 
-        results_df = predict_corrected_velocity_only(accel_df, saved_model)
-        predictions_json = results_df.to_dict(orient='records')
+        # Integrate acceleration
+        accel_df = preprocess_acceleration_to_velocity(accel_df)
+
+        # Predict corrections
+        time_col = 'time'
+        calc_v_col = 'velocity'
+        X = accel_df[[time_col, calc_v_col]].values
+        predicted_correction = saved_model.predict(X)
+        corrected_velocity = accel_df[calc_v_col] + predicted_correction
+
+        # Return only the average corrected velocity
+        avg_corrected_vel = float(corrected_velocity.mean())
 
         return jsonify({
             "message": "Predicted corrected velocity using saved model.",
-            "predictions": predictions_json
+            "average_corrected_velocity": avg_corrected_vel
         }), 200
 
     except Exception as e:
@@ -328,9 +317,9 @@ def predict_endpoint():
 @app.route('/upload', methods=['GET'])
 def upload_page():
     """
-    A single page with two forms:
-      1) Train (POST /process) -> shows metrics + base64 plot inline
-      2) Predict (POST /predict) -> shows only JSON predictions
+    A single page with 2 forms:
+      1) Train (acceleration + true velocity) -> /process
+      2) Predict (acceleration only) -> /predict
     """
     html_content = """
     <!DOCTYPE html>
@@ -348,24 +337,23 @@ def upload_page():
                 margin-top: 40px;
                 margin-bottom: 40px;
             }
-            .plot-img {
-                max-width: 100%;
-                border: 1px solid #dee2e6;
-                margin-top: 10px;
-            }
             .results-block {
                 margin-top: 1rem;
                 padding: 1rem;
                 border: 1px solid #ccc;
+            }
+            .plot-img {
+                max-width: 100%;
+                border: 1px solid #dee2e6;
+                margin-top: 10px;
             }
         </style>
     </head>
     <body>
         <div class="container">
             <h1 class="text-primary mb-4">Velocity Processing & Permanent Model</h1>
-            <p>1) Train with acceleration & true velocity (<code>/process</code>).
-               If IoU &ge; 95%, model is saved. 
-               Then you can do inference with only acceleration (<code>/predict</code>).
+            <p>1) Train with acceleration &amp; true velocity (<code>/process</code>).
+               If IoU &ge; 95%, model is saved. Then you can do inference with only acceleration (<code>/predict</code>).
             </p>
             <div class="alert alert-info">
               <strong>Note:</strong> Heroku’s filesystem is ephemeral. The saved model may vanish upon dyno restart.
@@ -378,7 +366,6 @@ def upload_page():
                         <div class="card-body">
                             <h4 class="card-title">Train/Retrain Model</h4>
                             <form id="trainForm" method="POST" enctype="multipart/form-data">
-                                <input type="hidden" name="mode" value="train"/>
                                 <div class="mb-3">
                                     <label class="form-label">Acceleration CSV:</label>
                                     <input type="file" name="acceleration_file" class="form-control" required />
@@ -398,9 +385,8 @@ def upload_page():
                 <div class="col-md-6">
                     <div class="card mb-4 shadow-sm">
                         <div class="card-body">
-                            <h4 class="card-title">Predict</h4>
+                            <h4 class="card-title">Predict (Average Velocity)</h4>
                             <form id="predictForm" method="POST" enctype="multipart/form-data">
-                                <input type="hidden" name="mode" value="predict"/>
                                 <div class="mb-3">
                                     <label class="form-label">Acceleration CSV:</label>
                                     <input type="file" name="acceleration_file" class="form-control" required />
@@ -413,11 +399,11 @@ def upload_page():
                 </div>
             </div>
         </div>
-        
-        <!-- Bootstrap JS -->
+
+        <!-- Optional Bootstrap JS -->
         <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 
-        <!-- Inline JS to handle form submissions and show results inline -->
+        <!-- Inline JS to handle form submissions via fetch -->
         <script>
             const trainForm = document.getElementById('trainForm');
             const trainResultsDiv = document.getElementById('trainResults');
@@ -427,21 +413,16 @@ def upload_page():
                 trainResultsDiv.innerHTML = '<b>Training...</b>';
 
                 const formData = new FormData(trainForm);
-                // We'll post to /process
                 const response = await fetch('/process', {
                     method: 'POST',
                     body: formData
                 });
-
                 const data = await response.json();
-                if (!response.ok) {
-                    // Show error
+
+                if (!response.ok && data.error) {
                     trainResultsDiv.innerHTML = '<div class="text-danger">Error: ' + data.error + '</div>';
                 } else {
-                    // Display metrics and the base64 plot
-                    // We'll do a custom HTML like before
                     let html = '';
-                    
                     if (data.average_velocities_on_test_dataset) {
                         const avgData = data.average_velocities_on_test_dataset;
                         html += '<h5>Average Velocities on Test Dataset</h5>';
@@ -462,7 +443,6 @@ def upload_page():
                         html += '<h5>Plot:</h5>';
                         html += '<img class="plot-img" src="data:image/png;base64,' + data.plot_image_base64 + '"/>';
                     }
-
                     trainResultsDiv.innerHTML = html;
                 }
             });
@@ -475,18 +455,18 @@ def upload_page():
                 predictResultsDiv.innerHTML = '<b>Predicting...</b>';
 
                 const formData = new FormData(predictForm);
-                // We'll post to /predict
                 const response = await fetch('/predict', {
                     method: 'POST',
                     body: formData
                 });
-
                 const data = await response.json();
-                if (!response.ok) {
+
+                if (!response.ok && data.error) {
                     predictResultsDiv.innerHTML = '<div class="text-danger">Error: ' + data.error + '</div>';
                 } else {
-                    // data.predictions is an array of {time, calculated_velocity, predicted_correction, corrected_velocity}
-                    let html = '<h5>Predictions</h5><pre>' + JSON.stringify(data, null, 2) + '</pre>';
+                    // Only average_corrected_velocity is returned
+                    let html = '<h5>Prediction Result</h5>';
+                    html += '<p><strong>Average Corrected Velocity:</strong> ' + data.average_corrected_velocity.toFixed(3) + '</p>';
                     predictResultsDiv.innerHTML = html;
                 }
             });
@@ -495,7 +475,6 @@ def upload_page():
     </html>
     """
     return render_template_string(html_content)
-
 
 @app.route('/', methods=['GET'])
 def index():
