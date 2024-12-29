@@ -60,7 +60,6 @@ def preprocess_acceleration_to_velocity(df, time_col='time', ax_col='ax (m/s^2)'
     df['velocity'] = velocity
     return df
 
-
 # -------------------------------------------
 # 2) Preprocess True Velocity (Expansion)
 # -------------------------------------------
@@ -110,7 +109,6 @@ def preprocess_true_velocity(df_true, df_accel, time_col='time', speed_col='spee
         'true_velocity': expanded_speeds
     })
     return df_expanded
-
 
 # -------------------------------------------
 # 3) Processing Function
@@ -195,7 +193,6 @@ def process_data(accel_df, true_df):
     }
     return results
 
-
 # -------------------------------------------
 # 4) API Endpoint: /process
 # -------------------------------------------
@@ -233,75 +230,90 @@ def process_endpoint():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 # -------------------------------------------
 # 5) HTML Page Route: /upload
 # -------------------------------------------
 @app.route('/upload', methods=['GET'])
 def upload_page():
     """
-    This route returns an HTML page with a form to upload
-    both CSV files and display results (including the base64 image).
+    Render an HTML page that uses Bootstrap 5 for a better look & feel.
     """
     html_content = """
     <!DOCTYPE html>
-    <html>
+    <html lang="en">
     <head>
+        <meta charset="UTF-8" />
         <title>Velocity Processing</title>
+        <!-- Bootstrap 5 CSS (CDN) -->
+        <link 
+            rel="stylesheet" 
+            href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css"
+        >
         <style>
             body {
-                font-family: Arial, sans-serif;
-                margin: 40px;
+                margin-top: 40px;
+                margin-bottom: 40px;
             }
-            h1 {
-                color: #333;
-            }
-            form {
-                margin-bottom: 20px;
-            }
-            .results {
+            .results-card {
                 margin-top: 20px;
-                border: 1px solid #ccc;
-                padding: 10px;
             }
-            .error {
-                color: red;
+            .plot-img {
+                max-width: 100%;
+                border: 1px solid #dee2e6;
+                margin-top: 10px;
             }
-            ul {
-                list-style: none;
-                padding: 0;
-            }
-            li {
-                margin: 5px 0;
-            }
-            strong {
-                margin-right: 5px;
+            .card-title {
+                margin-bottom: 0;
             }
         </style>
     </head>
     <body>
-        <h1>Velocity Processing</h1>
-        <p>Upload your Acceleration CSV and True Velocity CSV here.</p>
-        <form id="uploadForm">
-            <label>Acceleration File:</label><br />
-            <input type="file" name="acceleration_file" accept=".csv" /><br /><br />
+        <div class="container">
+            <h1 class="text-primary mb-4">Velocity Processing</h1>
+            <p class="mb-4">Upload your Acceleration CSV and True Velocity CSV here.</p>
             
-            <label>True Velocity File:</label><br />
-            <input type="file" name="true_velocity_file" accept=".csv" /><br /><br />
+            <div class="card p-4 shadow-sm">
+                <form id="uploadForm" class="row g-3">
+                    <div class="col-md-6">
+                        <label class="form-label fw-bold">Acceleration File:</label>
+                        <input 
+                            type="file" 
+                            name="acceleration_file" 
+                            accept=".csv" 
+                            class="form-control" 
+                            required
+                        />
+                    </div>
+                    <div class="col-md-6">
+                        <label class="form-label fw-bold">True Velocity File:</label>
+                        <input 
+                            type="file" 
+                            name="true_velocity_file" 
+                            accept=".csv" 
+                            class="form-control" 
+                            required
+                        />
+                    </div>
+                    <div class="col-12 mt-3">
+                        <button type="submit" class="btn btn-primary">
+                            Submit
+                        </button>
+                    </div>
+                </form>
+            </div>
+
+            <div id="message" class="text-danger fw-bold mt-3"></div>
             
-            <button type="submit">Submit</button>
-        </form>
-
-        <div id="message" class="error"></div>
-        
-        <div class="results" id="results" style="display: none;">
-            <h2>Results:</h2>
-            <!-- We'll place our custom formatted results here -->
-            <div id="resultsJson"></div>
-
-            <h3>Plot:</h3>
-            <img id="plotImage" src="" alt="Velocity Plot" style="max-width: 600px;"/>
+            <div id="results" class="results-card card mt-4 p-4" style="display: none;">
+                <h2 class="card-title mb-3">Results:</h2>
+                <div id="resultsJson"></div>
+                <h4 class="mt-4">Plot:</h4>
+                <img id="plotImage" class="plot-img" src="" alt="Velocity Plot"/>
+            </div>
         </div>
+
+        <!-- Bootstrap 5 JS (CDN) - for optional dynamic features -->
+        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 
         <script>
             const form = document.getElementById('uploadForm');
@@ -354,15 +366,14 @@ def upload_page():
 
                     // Build HTML for the results
                     const customResultsHtml = `
-                        <h3>Average Velocities on Test Dataset</h3>
-                        <ul>
+                        <h4 class="mb-3">Average Velocities on Test Dataset</h4>
+                        <ul class="list-unstyled ps-3">
                             <li><strong>Average Corrected Velocity:</strong> ${fmt(avgData.Average_Corrected_Velocity)}</li>
                             <li><strong>Average True Velocity:</strong> ${fmt(avgData.Average_True_Velocity)}</li>
                             <li><strong>Difference (Corrected vs True):</strong> ${fmt(avgData.Difference_Corrected_vs_True)}</li>
                         </ul>
-
-                        <h3>Model Evaluation</h3>
-                        <ul>
+                        <h4 class="mt-4 mb-3">Model Evaluation</h4>
+                        <ul class="list-unstyled ps-3">
                             <li><strong>Corrected Velocity MAE:</strong> ${fmt(evalData.Corrected_Velocity_MAE)}</li>
                             <li><strong>Corrected Velocity RMSE:</strong> ${fmt(evalData.Corrected_Velocity_RMSE)}</li>
                             <li><strong>Test Set MAE:</strong> ${fmt(evalData.Test_Set_MAE)}</li>
@@ -389,17 +400,15 @@ def upload_page():
     """
     return render_template_string(html_content)
 
-
 # -------------------------------------------
 # 6) Simple Home Route (optional)
 # -------------------------------------------
 @app.route('/', methods=['GET'])
 def index():
     return """
-    <h1>Welcome to Velocity Processing!</h1>
-    <p><a href="/upload">Go to Upload Page</a></p>
+    <h1 class="text-center">Welcome to Velocity Processing!</h1>
+    <p class="text-center"><a href="/upload">Go to Upload Page</a></p>
     """
-
 
 if __name__ == '__main__':
     app.run(debug=True)
