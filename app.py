@@ -1,14 +1,15 @@
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')  # Important for Heroku: use non-GUI backend
 import matplotlib.pyplot as plt
 import io
 import base64
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from math import sqrt
-import random
 
 app = Flask(__name__)
 
@@ -66,6 +67,7 @@ def preprocess_acceleration_to_velocity(df, time_col='time', ax_col='ax (m/s^2)'
     df['velocity'] = velocity
     return df
 
+
 # -------------------------------------------
 # 2) Preprocess True Velocity (Expansion)
 # -------------------------------------------
@@ -88,32 +90,25 @@ def preprocess_true_velocity(df_true, df_accel, time_col='time', speed_col='spee
         raise ValueError("True velocity dataset has 0 rows. Cannot expand.")
 
     ratio = n1 / n2
-    # We'll use the integer part of (ratio - 1) for expansions after each original row:
     ratio_minus_1_int = int(np.floor(ratio - 1)) if ratio > 1 else 0
 
-    # Prepare a list to hold the expanded speeds
     expanded_speeds = []
-    original_index = 0
 
     for i in range(n2):
         original_speed = df_true[speed_col].iloc[i]
         # 1) Append the original row's speed
         expanded_speeds.append(original_speed)
-
         # 2) Append (ratio - 1) new rows (integer part)
         for _ in range(ratio_minus_1_int):
-            # Generate a random speed ~5% around the original_speed
             low_val  = original_speed * 0.95
             high_val = original_speed * 1.05
             new_speed = np.random.uniform(low_val, high_val)
             expanded_speeds.append(new_speed)
 
-    # We may still have a remainder to get exactly n1 rows
+    # Handle remainder to reach exactly n1 rows
     current_length = len(expanded_speeds)
     remainder = n1 - current_length
-
     if remainder > 0:
-        # We'll base it on the last original speed
         last_speed = df_true[speed_col].iloc[-1]
         for _ in range(remainder):
             low_val  = last_speed * 0.95
@@ -121,23 +116,22 @@ def preprocess_true_velocity(df_true, df_accel, time_col='time', speed_col='spee
             new_speed = np.random.uniform(low_val, high_val)
             expanded_speeds.append(new_speed)
 
-    # Now we have at least n1 rows, but we need exactly n1
-    # (In rare cases, we could slightly overshoot if ratio < 2, but let's ensure we slice to n1)
     expanded_speeds = expanded_speeds[:n1]
 
-    # Create a new DataFrame with the same time index as df_accel
+    # Build expanded DataFrame
     df_expanded = pd.DataFrame({
-        time_col: df_accel[time_col].values,   # copy the entire time column from df_accel
-        'true_velocity': expanded_speeds       # the newly expanded speeds
+        time_col: df_accel[time_col].values,
+        'true_velocity': expanded_speeds
     })
 
     return df_expanded
+
 
 # -------------------------------------------
 # 3) Processing Function
 # -------------------------------------------
 def process_data(accel_df, true_df):
-    # Preprocess acceleration to velocity
+    # 3A) Preprocess acceleration to velocity
     accel_df = preprocess_acceleration_to_velocity(
         accel_df,
         time_col='time',
@@ -146,58 +140,52 @@ def process_data(accel_df, true_df):
         az_col='az (m/s^2)'
     )
 
-    # Expand True Velocity to Match Acceleration Rows
+    # 3B) Expand True Velocity
     true_df_expanded = preprocess_true_velocity(
         df_true=true_df,
         df_accel=accel_df,
         time_col='time',
-        speed_col='speed'  # must match your column name in the true velocity file
+        speed_col='speed'
     )
 
-    # Create a single DataFrame with 'calculated_velocity' and 'true_velocity'
+    # 3C) Merge into single DataFrame
     time_col = 'time'
-    calculated_velocity_col = 'velocity'
-    true_velocity_col = 'true_velocity'
-
-    # We can directly align them since they now have the same length and same times:
+    calc_v_col = 'velocity'
+    true_v_col = 'true_velocity'
     df = pd.DataFrame()
     df[time_col] = accel_df[time_col]
-    df[calculated_velocity_col] = accel_df[calculated_velocity_col]
-    df[true_velocity_col] = true_df_expanded[true_velocity_col]
+    df[calc_v_col] = accel_df[calc_v_col]
+    df[true_v_col] = true_df_expanded[true_v_col]
+    df['correction'] = df[true_v_col] - df[calc_v_col]
 
-    # Add a correction column
-    df['correction'] = df[true_velocity_col] - df[calculated_velocity_col]
-
-    # Prepare data for ML
-    X = df[[time_col, calculated_velocity_col]].values
+    # 3D) Train correction model
+    X = df[[time_col, calc_v_col]].values
     y = df['correction'].values
-
-    # Train-test split
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     model = RandomForestRegressor(n_estimators=100, random_state=42)
     model.fit(X_train, y_train)
 
-    # Evaluate the model on test set
+    # 3E) Evaluate on test set
     y_pred_test = model.predict(X_test)
     mae_test = mean_absolute_error(y_test, y_pred_test)
     rmse_test = np.sqrt(mean_squared_error(y_test, y_pred_test))
 
-    # Predict corrections on the full dataset
+    # 3F) Predict corrections for full data
     df['predicted_correction'] = model.predict(X)
-    df['corrected_velocity'] = df[calculated_velocity_col] + df['predicted_correction']
+    df['corrected_velocity'] = df[calc_v_col] + df['predicted_correction']
 
-    # Evaluate corrected velocity
-    mae_corrected = mean_absolute_error(df[true_velocity_col], df['corrected_velocity'])
-    rmse_corrected = np.sqrt(mean_squared_error(df[true_velocity_col], df['corrected_velocity']))
+    # 3G) Evaluate corrected velocity
+    mae_corrected = mean_absolute_error(df[true_v_col], df['corrected_velocity'])
+    rmse_corrected = np.sqrt(mean_squared_error(df[true_v_col], df['corrected_velocity']))
 
-    # Retrain condition (if 95%+ accuracy)
-    if mae_corrected / df[true_velocity_col].mean() <= 0.05:
-        model.fit(X, y)  # Retrain on the new data
+    # 3H) Conditional retrain
+    if (mae_corrected / df[true_v_col].mean()) <= 0.05:
+        model.fit(X, y)
 
-    # Prepare visualization as base64 encoded image
+    # 3I) Create plot, encode to base64
     plt.figure(figsize=(10, 6))
-    plt.plot(df[time_col], df[true_velocity_col], label='True Velocity', linestyle='--')
-    plt.plot(df[time_col], df[calculated_velocity_col], label='Calculated Velocity')
+    plt.plot(df[time_col], df[true_v_col], label='True Velocity', linestyle='--')
+    plt.plot(df[time_col], df[calc_v_col], label='Calculated Velocity')
     plt.plot(df[time_col], df['corrected_velocity'], label='Corrected Velocity')
     plt.xlabel('Time')
     plt.ylabel('Velocity')
@@ -209,15 +197,14 @@ def process_data(accel_df, true_df):
     image_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
     plt.close()
 
-    # Compute averages for the test dataset
-    test_times = X_test[:, 0]  # the times used in the test split
+    # 3J) Compute test dataset averages
+    test_times = X_test[:, 0]
     test_df = df[df[time_col].isin(test_times)]
+    avg_corrected = test_df['corrected_velocity'].mean()
+    avg_true = test_df[true_v_col].mean()
+    diff_corr_true = abs(avg_corrected - avg_true)
 
-    avg_corrected_velocity = test_df['corrected_velocity'].mean()
-    avg_true_velocity = test_df[true_velocity_col].mean()
-    velocity_difference = abs(avg_corrected_velocity - avg_true_velocity)
-
-    # Compile results
+    # 3K) Final results
     results = {
         "model_evaluation": {
             "Test_Set_MAE": mae_test,
@@ -226,17 +213,18 @@ def process_data(accel_df, true_df):
             "Corrected_Velocity_RMSE": rmse_corrected
         },
         "average_velocities_on_test_dataset": {
-            "Average_Corrected_Velocity": avg_corrected_velocity,
-            "Average_True_Velocity": avg_true_velocity,
-            "Difference_Corrected_vs_True": velocity_difference
+            "Average_Corrected_Velocity": avg_corrected,
+            "Average_True_Velocity": avg_true,
+            "Difference_Corrected_vs_True": diff_corr_true
         },
         "plot_image_base64": image_base64
     }
 
     return results
 
+
 # -------------------------------------------
-# 4) API Endpoint
+# 4) API Endpoint: /process
 # -------------------------------------------
 @app.route('/process', methods=['POST'])
 def process_endpoint():
@@ -251,10 +239,11 @@ def process_endpoint():
 
     try:
         # Read CSV files into DataFrames
+        import csv
         accel_df = pd.read_csv(io.StringIO(accel_file.stream.read().decode("UTF8")), low_memory=False)
         true_df = pd.read_csv(io.StringIO(true_file.stream.read().decode("UTF8")), low_memory=False)
 
-        # Convert all column names to lowercase for consistency
+        # Convert columns to lowercase
         accel_df.columns = accel_df.columns.str.lower()
         true_df.columns = true_df.columns.str.lower()
 
@@ -272,18 +261,136 @@ def process_endpoint():
         # Process data
         results = process_data(accel_df, true_df)
 
-        return jsonify(results)
+        return jsonify(results), 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# Optional: A simple homepage for testing
+
+# -------------------------------------------
+# 5) HTML Page Route: /upload
+# -------------------------------------------
+@app.route('/upload', methods=['GET'])
+def upload_page():
+    """
+    This route returns an HTML page with a form to upload
+    both CSV files and display results (including the base64 image).
+    """
+    html_content = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Velocity Processing</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                margin: 40px;
+            }
+            h1 {
+                color: #333;
+            }
+            form {
+                margin-bottom: 20px;
+            }
+            .results {
+                margin-top: 20px;
+                border: 1px solid #ccc;
+                padding: 10px;
+            }
+            .error {
+                color: red;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>Velocity Processing</h1>
+        <p>Upload your Acceleration CSV and True Velocity CSV here.</p>
+        <form id="uploadForm">
+            <label>Acceleration File:</label><br />
+            <input type="file" name="acceleration_file" accept=".csv" /><br /><br />
+            
+            <label>True Velocity File:</label><br />
+            <input type="file" name="true_velocity_file" accept=".csv" /><br /><br />
+            
+            <button type="submit">Submit</button>
+        </form>
+
+        <div id="message" class="error"></div>
+        
+        <div class="results" id="results" style="display: none;">
+            <h2>Results:</h2>
+            <pre id="resultsJson"></pre>
+            <h3>Plot:</h3>
+            <img id="plotImage" src="" alt="Velocity Plot" style="max-width: 600px;"/>
+        </div>
+
+        <script>
+            const form = document.getElementById('uploadForm');
+            form.addEventListener('submit', async function(event) {
+                event.preventDefault();  // Prevent the default form submission
+
+                const messageDiv = document.getElementById('message');
+                const resultsDiv = document.getElementById('results');
+                const resultsJson = document.getElementById('resultsJson');
+                const plotImage = document.getElementById('plotImage');
+
+                // Clear previous messages
+                messageDiv.textContent = '';
+                resultsDiv.style.display = 'none';
+                resultsJson.textContent = '';
+                plotImage.src = '';
+
+                // Prepare form data
+                const formData = new FormData(form);
+
+                try {
+                    const response = await fetch('/process', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (!response.ok) {
+                        // If the response returned an error, display it
+                        if (data.error) {
+                            messageDiv.textContent = "Error: " + data.error;
+                        } else {
+                            messageDiv.textContent = "An unknown error occurred.";
+                        }
+                        return;
+                    }
+
+                    // Display the JSON
+                    resultsDiv.style.display = 'block';
+                    resultsJson.textContent = JSON.stringify(data, null, 2);
+
+                    if (data.plot_image_base64) {
+                        plotImage.src = "data:image/png;base64," + data.plot_image_base64;
+                    }
+
+                } catch (error) {
+                    console.error("Error uploading files:", error);
+                    messageDiv.textContent = "Error uploading files: " + error;
+                }
+            });
+        </script>
+    </body>
+    </html>
+    """
+    return render_template_string(html_content)
+
+
+# -------------------------------------------
+# 6) Simple Home Route (optional)
+# -------------------------------------------
 @app.route('/', methods=['GET'])
 def index():
     return """
-    <h1>Velocity Processing API</h1>
-    <p>Use the /process endpoint to upload acceleration and true velocity CSV files.</p>
+    <h1>Welcome to Velocity Processing!</h1>
+    <p><a href="/upload">Go to Upload Page</a></p>
     """
 
+# For local development:
 if __name__ == '__main__':
     app.run(debug=True)
