@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use('Agg')  # Important for Heroku: use non-GUI backend
+matplotlib.use('Agg')  # Important for Heroku: non-GUI backend
 import matplotlib.pyplot as plt
 import io
 import base64
@@ -157,6 +157,18 @@ def process_data(accel_df, true_df):
     if (mae_corrected / df[true_v_col].mean()) <= 0.05:
         model.fit(X, y)
 
+    # ------------------------------
+    # IoU Accuracy Calculation
+    # ------------------------------
+    min_values = np.minimum(df[true_v_col], df['corrected_velocity'])
+    max_values = np.maximum(df[true_v_col], df['corrected_velocity'])
+    iou_accuracy = (np.sum(min_values) / np.sum(max_values)) * 100
+
+    # Print to server logs
+    print("\n=== Model Evaluation ===")
+    print(f"IoU Accuracy: {iou_accuracy:.4f}%")
+
+    # Create a comparison plot
     plt.figure(figsize=(10, 6))
     plt.plot(df[time_col], df[true_v_col], label='True Velocity', linestyle='--')
     plt.plot(df[time_col], df[calc_v_col], label='Calculated Velocity')
@@ -171,12 +183,14 @@ def process_data(accel_df, true_df):
     image_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
     plt.close()
 
+    # Evaluate on the test subset
     test_times = X_test[:, 0]
     test_df = df[df[time_col].isin(test_times)]
     avg_corrected = test_df['corrected_velocity'].mean()
     avg_true = test_df[true_v_col].mean()
     diff_corr_true = abs(avg_corrected - avg_true)
 
+    # Return all results, including IoU
     results = {
         "average_velocities_on_test_dataset": {
             "Average_Corrected_Velocity": avg_corrected,
@@ -187,7 +201,8 @@ def process_data(accel_df, true_df):
             "Corrected_Velocity_MAE": mae_corrected,
             "Corrected_Velocity_RMSE": rmse_corrected,
             "Test_Set_MAE": mae_test,
-            "Test_Set_RMSE": rmse_test
+            "Test_Set_RMSE": rmse_test,
+            "IoU_Accuracy": iou_accuracy  # Added to JSON response
         },
         "plot_image_base64": image_base64
     }
@@ -231,12 +246,12 @@ def process_endpoint():
         return jsonify({"error": str(e)}), 500
 
 # -------------------------------------------
-# 5) HTML Page Route: /upload
+# 5) HTML Page Route: /upload (Bootstrap UI)
 # -------------------------------------------
 @app.route('/upload', methods=['GET'])
 def upload_page():
     """
-    Render an HTML page that uses Bootstrap 5 for a better look & feel.
+    Render an HTML page that uses Bootstrap 5 for a nicer look & feel.
     """
     html_content = """
     <!DOCTYPE html>
@@ -355,16 +370,16 @@ def upload_page():
                     // Show the results section
                     resultsDiv.style.display = 'block';
 
-                    // Create custom display for numeric results
+                    // Extract data
                     const avgData = data.average_velocities_on_test_dataset;
                     const evalData = data.model_evaluation;
 
-                    // Helper function for rounding
+                    // Helper for rounding
                     function fmt(num, decimals=3) {
                         return parseFloat(num).toFixed(decimals);
                     }
 
-                    // Build HTML for the results
+                    // Build HTML
                     const customResultsHtml = `
                         <h4 class="mb-3">Average Velocities on Test Dataset</h4>
                         <ul class="list-unstyled ps-3">
@@ -378,13 +393,12 @@ def upload_page():
                             <li><strong>Corrected Velocity RMSE:</strong> ${fmt(evalData.Corrected_Velocity_RMSE)}</li>
                             <li><strong>Test Set MAE:</strong> ${fmt(evalData.Test_Set_MAE)}</li>
                             <li><strong>Test Set RMSE:</strong> ${fmt(evalData.Test_Set_RMSE)}</li>
+                            <li><strong>IoU Accuracy:</strong> ${fmt(evalData.IoU_Accuracy)}</li>
                         </ul>
                     `;
                     
-                    // Insert the new HTML
                     resultsJson.innerHTML = customResultsHtml;
 
-                    // Show the plot
                     if (data.plot_image_base64) {
                         plotImage.src = "data:image/png;base64," + data.plot_image_base64;
                     }
