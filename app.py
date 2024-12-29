@@ -18,7 +18,6 @@ app = Flask(__name__)
 # ---------------------------
 def preprocess_acceleration_to_velocity(df, time_col='time', ax_col='ax (m/s^2)', ay_col='ay (m/s^2)', az_col='az (m/s^2)'):
     """Convert acceleration data to velocity using integration, with error handling for sudden spikes."""
-    # Compute rolling mean and std for dynamic thresholding
     df['ax_rolling_mean'] = df[ax_col].rolling(window=5, center=True).mean()
     df['ay_rolling_mean'] = df[ay_col].rolling(window=5, center=True).mean()
     df['az_rolling_mean'] = df[az_col].rolling(window=5, center=True).mean()
@@ -27,10 +26,7 @@ def preprocess_acceleration_to_velocity(df, time_col='time', ax_col='ax (m/s^2)'
     df['ay_rolling_std'] = df[ay_col].rolling(window=5, center=True).std().fillna(0)
     df['az_rolling_std'] = df[az_col].rolling(window=5, center=True).std().fillna(0)
 
-    # Define a dynamic threshold as multiple of standard deviation
     std_multiplier = 3
-
-    # Replace spikes with rolling mean
     for col, mean_col, std_col in zip([ax_col, ay_col, az_col],
                                       ['ax_rolling_mean', 'ay_rolling_mean', 'az_rolling_mean'],
                                       ['ax_rolling_std', 'ay_rolling_std', 'az_rolling_std']):
@@ -40,11 +36,9 @@ def preprocess_acceleration_to_velocity(df, time_col='time', ax_col='ax (m/s^2)'
             df[col]
         )
 
-    # Drop intermediate columns
     df.drop(columns=['ax_rolling_mean', 'ay_rolling_mean', 'az_rolling_mean',
                      'ax_rolling_std', 'ay_rolling_std', 'az_rolling_std'], inplace=True)
 
-    # Calculate velocity by integration
     df['time_diff'] = df[time_col].diff().fillna(0)
     velocity = [0]  # Starting velocity
 
@@ -52,7 +46,6 @@ def preprocess_acceleration_to_velocity(df, time_col='time', ax_col='ax (m/s^2)'
         ax, ay, az = df.loc[i, [ax_col, ay_col, az_col]]
         time_diff = df.loc[i, 'time_diff']
 
-        # Determine dominant axis or combined magnitude
         if abs(ax) > abs(ay) and abs(ax) > abs(az):
             accel = ax
         elif abs(ay) > abs(ax) and abs(ay) > abs(az):
@@ -80,12 +73,10 @@ def preprocess_true_velocity(df_true, df_accel, time_col='time', speed_col='spee
     - Fill new rows' speed with random values near the original row's speed.
     - Assign time from df_accel.
     """
-    # Keep only time and speed
     df_true = df_true[[time_col, speed_col]]
 
-    # Calculate final row count
-    n1 = len(df_accel)  # target number of rows
-    n2 = len(df_true)   # original number of rows
+    n1 = len(df_accel)
+    n2 = len(df_true)
     if n2 == 0:
         raise ValueError("True velocity dataset has 0 rows. Cannot expand.")
 
@@ -93,19 +84,15 @@ def preprocess_true_velocity(df_true, df_accel, time_col='time', speed_col='spee
     ratio_minus_1_int = int(np.floor(ratio - 1)) if ratio > 1 else 0
 
     expanded_speeds = []
-
     for i in range(n2):
         original_speed = df_true[speed_col].iloc[i]
-        # 1) Append the original row's speed
         expanded_speeds.append(original_speed)
-        # 2) Append (ratio - 1) new rows (integer part)
         for _ in range(ratio_minus_1_int):
             low_val  = original_speed * 0.95
             high_val = original_speed * 1.05
             new_speed = np.random.uniform(low_val, high_val)
             expanded_speeds.append(new_speed)
 
-    # Handle remainder to reach exactly n1 rows
     current_length = len(expanded_speeds)
     remainder = n1 - current_length
     if remainder > 0:
@@ -118,12 +105,10 @@ def preprocess_true_velocity(df_true, df_accel, time_col='time', speed_col='spee
 
     expanded_speeds = expanded_speeds[:n1]
 
-    # Build expanded DataFrame
     df_expanded = pd.DataFrame({
         time_col: df_accel[time_col].values,
         'true_velocity': expanded_speeds
     })
-
     return df_expanded
 
 
@@ -131,7 +116,6 @@ def preprocess_true_velocity(df_true, df_accel, time_col='time', speed_col='spee
 # 3) Processing Function
 # -------------------------------------------
 def process_data(accel_df, true_df):
-    # 3A) Preprocess acceleration to velocity
     accel_df = preprocess_acceleration_to_velocity(
         accel_df,
         time_col='time',
@@ -140,7 +124,6 @@ def process_data(accel_df, true_df):
         az_col='az (m/s^2)'
     )
 
-    # 3B) Expand True Velocity
     true_df_expanded = preprocess_true_velocity(
         df_true=true_df,
         df_accel=accel_df,
@@ -148,7 +131,6 @@ def process_data(accel_df, true_df):
         speed_col='speed'
     )
 
-    # 3C) Merge into single DataFrame
     time_col = 'time'
     calc_v_col = 'velocity'
     true_v_col = 'true_velocity'
@@ -158,31 +140,25 @@ def process_data(accel_df, true_df):
     df[true_v_col] = true_df_expanded[true_v_col]
     df['correction'] = df[true_v_col] - df[calc_v_col]
 
-    # 3D) Train correction model
     X = df[[time_col, calc_v_col]].values
     y = df['correction'].values
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     model = RandomForestRegressor(n_estimators=100, random_state=42)
     model.fit(X_train, y_train)
 
-    # 3E) Evaluate on test set
     y_pred_test = model.predict(X_test)
     mae_test = mean_absolute_error(y_test, y_pred_test)
     rmse_test = np.sqrt(mean_squared_error(y_test, y_pred_test))
 
-    # 3F) Predict corrections for full data
     df['predicted_correction'] = model.predict(X)
     df['corrected_velocity'] = df[calc_v_col] + df['predicted_correction']
 
-    # 3G) Evaluate corrected velocity
     mae_corrected = mean_absolute_error(df[true_v_col], df['corrected_velocity'])
     rmse_corrected = np.sqrt(mean_squared_error(df[true_v_col], df['corrected_velocity']))
 
-    # 3H) Conditional retrain
     if (mae_corrected / df[true_v_col].mean()) <= 0.05:
         model.fit(X, y)
 
-    # 3I) Create plot, encode to base64
     plt.figure(figsize=(10, 6))
     plt.plot(df[time_col], df[true_v_col], label='True Velocity', linestyle='--')
     plt.plot(df[time_col], df[calc_v_col], label='Calculated Velocity')
@@ -197,29 +173,26 @@ def process_data(accel_df, true_df):
     image_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
     plt.close()
 
-    # 3J) Compute test dataset averages
     test_times = X_test[:, 0]
     test_df = df[df[time_col].isin(test_times)]
     avg_corrected = test_df['corrected_velocity'].mean()
     avg_true = test_df[true_v_col].mean()
     diff_corr_true = abs(avg_corrected - avg_true)
 
-    # 3K) Final results
     results = {
-        "model_evaluation": {
-            "Test_Set_MAE": mae_test,
-            "Test_Set_RMSE": rmse_test,
-            "Corrected_Velocity_MAE": mae_corrected,
-            "Corrected_Velocity_RMSE": rmse_corrected
-        },
         "average_velocities_on_test_dataset": {
             "Average_Corrected_Velocity": avg_corrected,
             "Average_True_Velocity": avg_true,
             "Difference_Corrected_vs_True": diff_corr_true
         },
+        "model_evaluation": {
+            "Corrected_Velocity_MAE": mae_corrected,
+            "Corrected_Velocity_RMSE": rmse_corrected,
+            "Test_Set_MAE": mae_test,
+            "Test_Set_RMSE": rmse_test
+        },
         "plot_image_base64": image_base64
     }
-
     return results
 
 
@@ -238,16 +211,12 @@ def process_endpoint():
         return jsonify({"error": "No selected file"}), 400
 
     try:
-        # Read CSV files into DataFrames
-        import csv
         accel_df = pd.read_csv(io.StringIO(accel_file.stream.read().decode("UTF8")), low_memory=False)
         true_df = pd.read_csv(io.StringIO(true_file.stream.read().decode("UTF8")), low_memory=False)
 
-        # Convert columns to lowercase
         accel_df.columns = accel_df.columns.str.lower()
         true_df.columns = true_df.columns.str.lower()
 
-        # Check required columns
         required_accel_columns = ['ax (m/s^2)', 'ay (m/s^2)', 'az (m/s^2)', 'time']
         missing_accel_cols = [col for col in required_accel_columns if col not in accel_df.columns]
         if missing_accel_cols:
@@ -258,9 +227,7 @@ def process_endpoint():
         if missing_true_cols:
             return jsonify({"error": f"Missing columns in true velocity dataset: {missing_true_cols}"}), 400
 
-        # Process data
         results = process_data(accel_df, true_df)
-
         return jsonify(results), 200
 
     except Exception as e:
@@ -300,6 +267,16 @@ def upload_page():
             .error {
                 color: red;
             }
+            ul {
+                list-style: none;
+                padding: 0;
+            }
+            li {
+                margin: 5px 0;
+            }
+            strong {
+                margin-right: 5px;
+            }
         </style>
     </head>
     <body>
@@ -319,7 +296,9 @@ def upload_page():
         
         <div class="results" id="results" style="display: none;">
             <h2>Results:</h2>
-            <pre id="resultsJson"></pre>
+            <!-- We'll place our custom formatted results here -->
+            <div id="resultsJson"></div>
+
             <h3>Plot:</h3>
             <img id="plotImage" src="" alt="Velocity Plot" style="max-width: 600px;"/>
         </div>
@@ -327,7 +306,7 @@ def upload_page():
         <script>
             const form = document.getElementById('uploadForm');
             form.addEventListener('submit', async function(event) {
-                event.preventDefault();  // Prevent the default form submission
+                event.preventDefault();
 
                 const messageDiv = document.getElementById('message');
                 const resultsDiv = document.getElementById('results');
@@ -337,7 +316,7 @@ def upload_page():
                 // Clear previous messages
                 messageDiv.textContent = '';
                 resultsDiv.style.display = 'none';
-                resultsJson.textContent = '';
+                resultsJson.innerHTML = '';
                 plotImage.src = '';
 
                 // Prepare form data
@@ -361,10 +340,40 @@ def upload_page():
                         return;
                     }
 
-                    // Display the JSON
+                    // Show the results section
                     resultsDiv.style.display = 'block';
-                    resultsJson.textContent = JSON.stringify(data, null, 2);
 
+                    // Create custom display for numeric results
+                    const avgData = data.average_velocities_on_test_dataset;
+                    const evalData = data.model_evaluation;
+
+                    // Helper function for rounding
+                    function fmt(num, decimals=3) {
+                        return parseFloat(num).toFixed(decimals);
+                    }
+
+                    // Build HTML for the results
+                    const customResultsHtml = `
+                        <h3>Average Velocities on Test Dataset</h3>
+                        <ul>
+                            <li><strong>Average Corrected Velocity:</strong> ${fmt(avgData.Average_Corrected_Velocity)}</li>
+                            <li><strong>Average True Velocity:</strong> ${fmt(avgData.Average_True_Velocity)}</li>
+                            <li><strong>Difference (Corrected vs True):</strong> ${fmt(avgData.Difference_Corrected_vs_True)}</li>
+                        </ul>
+
+                        <h3>Model Evaluation</h3>
+                        <ul>
+                            <li><strong>Corrected Velocity MAE:</strong> ${fmt(evalData.Corrected_Velocity_MAE)}</li>
+                            <li><strong>Corrected Velocity RMSE:</strong> ${fmt(evalData.Corrected_Velocity_RMSE)}</li>
+                            <li><strong>Test Set MAE:</strong> ${fmt(evalData.Test_Set_MAE)}</li>
+                            <li><strong>Test Set RMSE:</strong> ${fmt(evalData.Test_Set_RMSE)}</li>
+                        </ul>
+                    `;
+                    
+                    // Insert the new HTML
+                    resultsJson.innerHTML = customResultsHtml;
+
+                    // Show the plot
                     if (data.plot_image_base64) {
                         plotImage.src = "data:image/png;base64," + data.plot_image_base64;
                     }
@@ -391,6 +400,6 @@ def index():
     <p><a href="/upload">Go to Upload Page</a></p>
     """
 
-# For local development:
+
 if __name__ == '__main__':
     app.run(debug=True)
