@@ -448,6 +448,7 @@ def upload_page():
             html += '<h5>Average Velocities on This New Dataset</h5>';
             html += '<p>Average Corrected Velocity: ' + avgData.Average_Corrected_Velocity.toFixed(3) + '</p>';
             html += '<p>Average True Velocity: ' + avgData.Average_True_Velocity.toFixed(3) + '</p>';
+            html += `<p>Difference (Corrected vs True): ${avgData.Difference_Corrected_vs_True.toFixed(3)}</p>`;
           }
           if (data.model_evaluation) {
             const evalData = data.model_evaluation;
