@@ -5,13 +5,14 @@ import base64
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use('Agg')  # For Heroku or headless environments
+matplotlib.use('Agg')  # For Heroku or any headless server
 import matplotlib.pyplot as plt
 
 from flask import Flask, request, jsonify, render_template_string
 from pymongo import MongoClient
 from math import sqrt
 import joblib
+import logging
 
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
@@ -20,19 +21,31 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 app = Flask(__name__)
 
 ################################################################################
-# 1) MongoDB Connection: Read from environment variable
+# 1) Configure Logging
 ################################################################################
 
-# Read MongoDB URI from environment variable
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+################################################################################
+# 2) MongoDB Connection: Read from environment variable
+################################################################################
+
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+logger.info(f"Connecting to MongoDB with URI: {MONGO_URI}")
 
-# Initialize MongoDB client
-client = MongoClient(MONGO_URI)
-
-# Define database and collections
-db = client["velocity_db"]   # Database name
-accel_collection = db["accel_data"]  # Collection for acceleration data
-true_collection  = db["true_data"]   # Collection for true velocity data
+try:
+    client = MongoClient(MONGO_URI)
+    db = client["velocity_db"]   # Ensure this matches your connection string
+    accel_collection = db["accel_data"]
+    true_collection  = db["true_data"]
+    logger.info("Successfully connected to MongoDB.")
+except Exception as e:
+    logger.error(f"Failed to connect to MongoDB: {str(e)}")
+    client = None
+    db = None
+    accel_collection = None
+    true_collection = None
 
 # Model file name
 MODEL_FILENAME = "model.pkl"
@@ -42,13 +55,13 @@ saved_model    = None
 if os.path.exists(MODEL_FILENAME):
     try:
         saved_model = joblib.load(MODEL_FILENAME)
-        print(f"Loaded saved model from {MODEL_FILENAME}")
+        logger.info(f"Loaded saved model from {MODEL_FILENAME}")
     except Exception as e:
-        print(f"Could not load model from {MODEL_FILENAME}. Error: {str(e)}")
+        logger.error(f"Could not load model from {MODEL_FILENAME}. Error: {str(e)}")
         saved_model = None
 
 ################################################################################
-# 2) Helper Functions: Preprocessing and Training
+# 3) Helper Functions: Preprocessing and Training
 ################################################################################
 
 def preprocess_acceleration_to_velocity(df, time_col='time',
@@ -201,6 +214,8 @@ def train_model_on_all_data(max_iterations=10):
     best_metrics = {}
 
     for iteration in range(max_iterations):
+        logger.info(f"Training iteration {iteration + 1}/{max_iterations}")
+
         # Train/Test split
         X = combined_df[['time', 'velocity']].values
         y = combined_df['correction'].values
@@ -223,6 +238,11 @@ def train_model_on_all_data(max_iterations=10):
 
         # Compute IoU
         iou = compute_iou(combined_df['true_velocity'].values, combined_df['corrected_velocity'].values)
+        logger.info(f"Iteration {iteration + 1}: IoU = {iou:.2f}%")
+
+        # Compute additional metrics
+        mae_corr = mean_absolute_error(combined_df['true_velocity'], combined_df['corrected_velocity'])
+        rmse_corr = np.sqrt(mean_squared_error(combined_df['true_velocity'], combined_df['corrected_velocity']))
 
         # Update best model if current IoU is better
         if iou > best_iou:
@@ -231,20 +251,17 @@ def train_model_on_all_data(max_iterations=10):
             best_metrics = {
                 "mae_test": mae_test,
                 "rmse_test": rmse_test,
-                "mae_corr": mean_absolute_error(combined_df['true_velocity'], combined_df['corrected_velocity']),
-                "rmse_corr": np.sqrt(mean_squared_error(combined_df['true_velocity'], combined_df['corrected_velocity'])),
+                "mae_corr": mae_corr,
+                "rmse_corr": rmse_corr,
                 "iou_acc": iou
             }
+            logger.info(f"New best IoU found: {best_iou:.2f}%")
 
-        # Optional: Early stopping if IoU is sufficiently high (e.g., 99%)
-        # Uncomment the following lines if you want early stopping
-        # if iou >= 99.0:
-        #     break
-
+    logger.info(f"Training completed. Best IoU: {best_iou:.2f}%")
     return best_model, best_metrics
 
 ################################################################################
-# 3) Routes: /process and /predict
+# 4) Routes: /process and /predict
 ################################################################################
 
 @app.route('/process', methods=['POST'])
@@ -258,6 +275,7 @@ def process_endpoint():
 
     # Check if both files are present
     if 'acceleration_file' not in request.files or 'true_velocity_file' not in request.files:
+        logger.warning("Missing 'acceleration_file' or 'true_velocity_file' in request.")
         return jsonify({"error": "Please provide both 'acceleration_file' and 'true_velocity_file'"}), 400
 
     accel_file = request.files['acceleration_file']
@@ -265,6 +283,7 @@ def process_endpoint():
 
     # Check if files have been selected
     if accel_file.filename == '' or true_file.filename == '':
+        logger.warning("No selected file(s) in request.")
         return jsonify({"error": "No selected file(s)"}), 400
 
     try:
@@ -280,19 +299,23 @@ def process_endpoint():
         required_accel = ['ax (m/s^2)', 'ay (m/s^2)', 'az (m/s^2)', 'time']
         missing_accel = [col for col in required_accel if col not in accel_df.columns]
         if missing_accel:
+            logger.warning(f"Missing columns in acceleration data: {missing_accel}")
             return jsonify({"error": f"Missing columns in acceleration data: {missing_accel}"}), 400
 
         required_true = ['time', 'speed']
         missing_true = [col for col in required_true if col not in true_df.columns]
         if missing_true:
+            logger.warning(f"Missing columns in true velocity data: {missing_true}")
             return jsonify({"error": f"Missing columns in true velocity data: {missing_true}"}), 400
 
         # Assign a unique dataset_id
         dataset_id = str(uuid.uuid4())
+        logger.info(f"Assigning dataset_id: {dataset_id}")
 
         # Store datasets in MongoDB
         store_csv_in_mongo(accel_collection, accel_df, dataset_id, tag_name="accel")
         store_csv_in_mongo(true_collection, true_df, dataset_id, tag_name="true")
+        logger.info(f"Stored datasets with dataset_id: {dataset_id}")
 
         # Train the model on all data with repeated iterations
         model, metrics = train_model_on_all_data(max_iterations=10)
@@ -302,7 +325,7 @@ def process_endpoint():
         if iou >= 95.0:
             joblib.dump(model, MODEL_FILENAME)
             saved_model = model
-            print("Model saved (IoU ≥ 95%)")
+            logger.info("Model saved (IoU ≥ 95%)")
 
         # Retrieve the newly uploaded dataset for plotting
         new_accel = accel_df.copy()
@@ -342,6 +365,7 @@ def process_endpoint():
         # Count total number of unique datasets
         total_datasets = accel_collection.distinct("dataset_id")
         num_datasets = len(total_datasets)
+        logger.info(f"Total datasets trained on: {num_datasets}")
 
         # Prepare acknowledgment message
         ack_msg = f"Trained on {num_datasets} total dataset(s). Final IoU: {iou:.2f}%."
@@ -364,11 +388,12 @@ def process_endpoint():
             "plot_image_base64": plot_b64
         }
 
+        logger.info("Process completed successfully.")
         return jsonify(response), 200
 
     except Exception as e:
         # Log the exception details for debugging
-        print(f"Error during /process: {str(e)}")
+        logger.error(f"Error during /process: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/predict', methods=['POST'])
@@ -381,21 +406,24 @@ def predict_endpoint():
 
     # Check if acceleration file is present
     if 'acceleration_file' not in request.files:
+        logger.warning("Missing 'acceleration_file' in request.")
         return jsonify({"error": "Please provide 'acceleration_file'"}), 400
 
     accel_file = request.files['acceleration_file']
 
     # Check if file has been selected
     if accel_file.filename == '':
+        logger.warning("No selected file in request.")
         return jsonify({"error": "No selected file"}), 400
 
     try:
         # Load the saved model if not already loaded
         if not saved_model and os.path.exists(MODEL_FILENAME):
             saved_model = joblib.load(MODEL_FILENAME)
-            print("Loaded saved model for prediction.")
+            logger.info("Loaded saved model for prediction.")
 
         if not saved_model:
+            logger.warning("No trained model found for prediction.")
             return jsonify({"error": "No trained model found. Please train the model first."}), 400
 
         # Read acceleration CSV into DataFrame
@@ -406,6 +434,7 @@ def predict_endpoint():
         required_accel = ['ax (m/s^2)', 'ay (m/s^2)', 'az (m/s^2)', 'time']
         missing_accel = [col for col in required_accel if col not in accel_df.columns]
         if missing_accel:
+            logger.warning(f"Missing columns in acceleration data: {missing_accel}")
             return jsonify({"error": f"Missing columns in acceleration data: {missing_accel}"}), 400
 
         # Preprocess acceleration data
@@ -427,15 +456,16 @@ def predict_endpoint():
             "average_corrected_velocity": avg_corrected_velocity
         }
 
+        logger.info("Prediction completed successfully.")
         return jsonify(response), 200
 
     except Exception as e:
         # Log the exception details for debugging
-        print(f"Error during /predict: {str(e)}")
+        logger.error(f"Error during /predict: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 ################################################################################
-# 4) Routes: /upload and /
+# 5) Routes: /upload and /
 ################################################################################
 
 @app.route('/upload', methods=['GET'])
@@ -595,7 +625,35 @@ def index():
     """
 
 ################################################################################
-# 5) Run the Flask App
+# 6) Additional Route for Testing Database Connection
+################################################################################
+
+@app.route('/test_db', methods=['GET'])
+def test_db():
+    """
+    A simple route to test the MongoDB connection.
+    """
+    if not client or not db:
+        return jsonify({"error": "Not connected to MongoDB."}), 500
+
+    try:
+        # Insert a test document
+        test_doc = {"test_key": "test_value"}
+        accel_collection.insert_one(test_doc)
+
+        # Retrieve the test document
+        retrieved_doc = accel_collection.find_one({"test_key": "test_value"})
+
+        # Clean up by deleting the test document
+        accel_collection.delete_one({"test_key": "test_value"})
+
+        return jsonify({"message": "Database connection successful!", "retrieved_doc": retrieved_doc}), 200
+    except Exception as e:
+        logger.error(f"Error during /test_db: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+################################################################################
+# 7) Run the Flask App
 ################################################################################
 
 if __name__ == '__main__':
