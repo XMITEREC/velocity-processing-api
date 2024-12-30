@@ -1,26 +1,37 @@
+import os
+import io
+import uuid
+import base64
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use('Agg')  # Non-GUI backend for Heroku
+matplotlib.use('Agg')  # For Heroku: non-GUI backend
 import matplotlib.pyplot as plt
-import io
-import base64
-import os
+
 from flask import Flask, request, jsonify, render_template_string
+from pymongo import MongoClient
+from math import sqrt
+import joblib
+
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-from math import sqrt
-import joblib  # For saving/loading the model
 
 app = Flask(__name__)
 
-MODEL_FILENAME = "model.pkl"
+# -----------------------------------------------------------------------------
+# 1) MongoDB Connection: read from environment variable (or fallback locally)
+# -----------------------------------------------------------------------------
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+client = MongoClient(MONGO_URI)
+db = client["velocity_db"]   # automatically created on first write
+accel_collection = db["accel_data"]
+true_collection  = db["true_data"]
 
-# ========================================
-# 1) Attempt to load previously saved model
-# ========================================
+MODEL_FILENAME = "model.pkl"
 saved_model = None
+
+# Attempt to load any saved model from disk
 if os.path.exists(MODEL_FILENAME):
     try:
         saved_model = joblib.load(MODEL_FILENAME)
@@ -30,14 +41,19 @@ if os.path.exists(MODEL_FILENAME):
         saved_model = None
 
 
-# ========================================
-# A) HELPER FUNCTIONS
-# ========================================
-def preprocess_acceleration_to_velocity(df, time_col='time', ax_col='ax (m/s^2)', ay_col='ay (m/s^2)', az_col='az (m/s^2)'):
+# -----------------------------------------------------------------------------
+# 2) HELPER FUNCTIONS: Acceleration Integration & True Velocity Expansion
+# -----------------------------------------------------------------------------
+def preprocess_acceleration_to_velocity(df,
+                                        time_col='time',
+                                        ax_col='ax (m/s^2)',
+                                        ay_col='ay (m/s^2)',
+                                        az_col='az (m/s^2)'):
     """
-    Integrates acceleration into velocity,
-    removing spikes via rolling mean thresholds.
+    1) Remove spikes via rolling mean/stdev replacement.
+    2) Integrate acceleration -> velocity.
     """
+    # Rolling means and std for spike removal
     df['ax_rolling_mean'] = df[ax_col].rolling(window=5, center=True).mean()
     df['ay_rolling_mean'] = df[ay_col].rolling(window=5, center=True).mean()
     df['az_rolling_mean'] = df[az_col].rolling(window=5, center=True).mean()
@@ -56,17 +72,18 @@ def preprocess_acceleration_to_velocity(df, time_col='time', ax_col='ax (m/s^2)'
             df[col]
         )
 
+    # Drop these helper columns
     df.drop(columns=['ax_rolling_mean', 'ay_rolling_mean', 'az_rolling_mean',
                      'ax_rolling_std', 'ay_rolling_std', 'az_rolling_std'], inplace=True)
 
+    # Integrate to get velocity
     df['time_diff'] = df[time_col].diff().fillna(0)
     velocity = [0]
-
     for i in range(1, len(df)):
         ax, ay, az = df.loc[i, [ax_col, ay_col, az_col]]
-        time_diff = df.loc[i, 'time_diff']
+        dt = df.loc[i, 'time_diff']
 
-        # Pick the dominant axis or total magnitude
+        # Pick dominant axis or total magnitude
         if abs(ax) > abs(ay) and abs(ax) > abs(az):
             accel = ax
         elif abs(ay) > abs(ax) and abs(ay) > abs(az):
@@ -76,22 +93,24 @@ def preprocess_acceleration_to_velocity(df, time_col='time', ax_col='ax (m/s^2)'
         else:
             accel = sqrt(ax**2 + ay**2 + az**2)
 
-        velocity.append(velocity[-1] + accel * time_diff)
+        velocity.append(velocity[-1] + accel*dt)
 
     df['velocity'] = velocity
     return df
 
 
-def preprocess_true_velocity(df_true, df_accel, time_col='time', speed_col='speed'):
+def preprocess_true_velocity(df_true, df_accel,
+                             time_col='time',
+                             speed_col='speed'):
     """
-    Expand the 'true velocity' dataset to match the row count of df_accel,
-    randomly interpolating speeds between rows.
+    Expand the true velocity dataset to match the # of rows in df_accel,
+    randomizing speeds ±5% for intermediate points.
     """
     df_true = df_true[[time_col, speed_col]]
     n1 = len(df_accel)
     n2 = len(df_true)
     if n2 == 0:
-        raise ValueError("True velocity dataset has 0 rows. Cannot expand.")
+        raise ValueError("True velocity dataset is empty, cannot expand.")
 
     ratio = n1 / n2
     ratio_minus_1_int = int(np.floor(ratio - 1)) if ratio > 1 else 0
@@ -99,23 +118,21 @@ def preprocess_true_velocity(df_true, df_accel, time_col='time', speed_col='spee
     expanded_speeds = []
     for i in range(n2):
         original_speed = df_true[speed_col].iloc[i]
+        # 1) original row
         expanded_speeds.append(original_speed)
+        # 2) add ratio-1 new rows
         for _ in range(ratio_minus_1_int):
-            low_val = original_speed * 0.95
-            high_val = original_speed * 1.05
-            new_speed = np.random.uniform(low_val, high_val)
-            expanded_speeds.append(new_speed)
+            new_val = np.random.uniform(original_speed*0.95, original_speed*1.05)
+            expanded_speeds.append(new_val)
 
-    # Fill the remainder if needed
+    # Fill remainder
     current_length = len(expanded_speeds)
     remainder = n1 - current_length
     if remainder > 0:
         last_speed = df_true[speed_col].iloc[-1]
         for _ in range(remainder):
-            low_val = last_speed * 0.95
-            high_val = last_speed * 1.05
-            new_speed = np.random.uniform(low_val, high_val)
-            expanded_speeds.append(new_speed)
+            new_val = np.random.uniform(last_speed*0.95, last_speed*1.05)
+            expanded_speeds.append(new_val)
 
     expanded_speeds = expanded_speeds[:n1]
 
@@ -126,147 +143,206 @@ def preprocess_true_velocity(df_true, df_accel, time_col='time', speed_col='spee
     return df_expanded
 
 
-# ========================================
-# B) TRAINING / RETRAINING FUNCTION
-# ========================================
-def process_data(accel_df, true_df):
-    # 1) Integrate acceleration
-    accel_df = preprocess_acceleration_to_velocity(accel_df)
+# -----------------------------------------------------------------------------
+# 3) UTILITY: Insert CSV Data into Mongo, Each with a Unique dataset_id
+# -----------------------------------------------------------------------------
+def store_csv_in_mongo(collection, df, dataset_id, tag_name):
+    """
+    Convert df rows into dicts, attach dataset_id + tag_name, and insert them.
+    """
+    records = df.to_dict(orient="records")
+    for r in records:
+        r["dataset_id"] = dataset_id
+        r["tag"] = tag_name
+    collection.insert_many(records)
 
-    # 2) Expand true velocity
+
+# -----------------------------------------------------------------------------
+# 4) Retrieving *All* Data from Mongo & Re-Training
+# -----------------------------------------------------------------------------
+def train_on_all_data():
+    """
+    1) Retrieve all data from both accel_collection & true_collection.
+    2) Preprocess, integrate, expand, train on the entire big dataset.
+    3) Return the model, metrics, final DataFrame, IoU, etc.
+    """
+    # Grab all docs
+    accel_docs = list(accel_collection.find({}))
+    true_docs  = list(true_collection.find({}))
+
+    # If no data => cannot train
+    if not accel_docs or not true_docs:
+        raise ValueError("No acceleration or true velocity data found in Mongo.")
+
+    # Convert to DataFrame
+    accel_df = pd.DataFrame(accel_docs)
+    true_df  = pd.DataFrame(true_docs)
+
+    # Drop _id columns
+    if "_id" in accel_df.columns:
+        accel_df.drop(columns=["_id"], inplace=True)
+    if "_id" in true_df.columns:
+        true_df.drop(columns=["_id"], inplace=True)
+
+    # Preprocess
+    accel_df = preprocess_acceleration_to_velocity(accel_df)
     true_df_expanded = preprocess_true_velocity(true_df, accel_df)
 
-    # 3) Merge into a single DataFrame
-    time_col = 'time'
-    calc_v_col = 'velocity'
-    true_v_col = 'true_velocity'
+    # Combine
     df = pd.DataFrame()
-    df[time_col] = accel_df[time_col]
-    df[calc_v_col] = accel_df[calc_v_col]
-    df[true_v_col] = true_df_expanded[true_v_col]
-    df['correction'] = df[true_v_col] - df[calc_v_col]
+    df['time']          = accel_df['time']
+    df['velocity']      = accel_df['velocity']
+    df['true_velocity'] = true_df_expanded['true_velocity']
+    df['correction']    = df['true_velocity'] - df['velocity']
 
-    # 4) Train a random forest
-    X = df[[time_col, calc_v_col]].values
+    # Train
+    X = df[['time', 'velocity']].values
     y = df['correction'].values
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     model = RandomForestRegressor(n_estimators=100, random_state=42)
     model.fit(X_train, y_train)
 
-    # 5) Evaluate on test set
+    # Evaluate test set
     y_pred_test = model.predict(X_test)
-    mae_test = mean_absolute_error(y_test, y_pred_test)
+    mae_test  = mean_absolute_error(y_test, y_pred_test)
     rmse_test = np.sqrt(mean_squared_error(y_test, y_pred_test))
 
-    # 6) Predict on full data
+    # Predict full
     df['predicted_correction'] = model.predict(X)
-    df['corrected_velocity'] = df[calc_v_col] + df['predicted_correction']
+    df['corrected_velocity']   = df['velocity'] + df['predicted_correction']
 
-    # 7) Evaluate corrected velocity
-    mae_corrected = mean_absolute_error(df[true_v_col], df['corrected_velocity'])
-    rmse_corrected = np.sqrt(mean_squared_error(df[true_v_col], df['corrected_velocity']))
+    mae_corr = mean_absolute_error(df['true_velocity'], df['corrected_velocity'])
+    rmse_corr= np.sqrt(mean_squared_error(df['true_velocity'], df['corrected_velocity']))
 
-    # 8) IoU Accuracy
-    min_values = np.minimum(df[true_v_col], df['corrected_velocity'])
-    max_values = np.maximum(df[true_v_col], df['corrected_velocity'])
-    iou_accuracy = (np.sum(min_values) / np.sum(max_values)) * 100
-    print("\n=== Model Evaluation ===")
-    print(f"IoU Accuracy: {iou_accuracy:.4f}%")
+    # IoU Accuracy
+    min_vals = np.minimum(df['true_velocity'], df['corrected_velocity'])
+    max_vals = np.maximum(df['true_velocity'], df['corrected_velocity'])
+    iou_accuracy = (min_vals.sum() / max_vals.sum()) * 100
 
-    # 9) If IoU≥95%, save model
-    if iou_accuracy >= 95.0:
-        joblib.dump(model, MODEL_FILENAME)
-        print(f"Model saved to {MODEL_FILENAME} because IoU ≥ 95%.")
-
-    # 10) Create a comparison plot
-    plt.figure(figsize=(10, 6))
-    plt.plot(df[time_col], df[true_v_col], label='True Velocity', linestyle='--')
-    plt.plot(df[time_col], df[calc_v_col], label='Calculated Velocity')
-    plt.plot(df[time_col], df['corrected_velocity'], label='Corrected Velocity')
-    plt.xlabel('Time')
-    plt.ylabel('Velocity')
-    plt.title('Velocity Comparison')
-    plt.legend()
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png')
-    buf.seek(0)
-    image_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-    plt.close()
-
-    # 11) Test subset stats
-    test_times = X_test[:, 0]
-    test_df = df[df[time_col].isin(test_times)]
-    avg_corrected = test_df['corrected_velocity'].mean()
-    avg_true = test_df[true_v_col].mean()
-    diff_corr_true = abs(avg_corrected - avg_true)
-
-    results = {
-        "average_velocities_on_test_dataset": {
-            "Average_Corrected_Velocity": avg_corrected,
-            "Average_True_Velocity": avg_true,
-            "Difference_Corrected_vs_True": diff_corr_true
-        },
-        "model_evaluation": {
-            "Corrected_Velocity_MAE": mae_corrected,
-            "Corrected_Velocity_RMSE": rmse_corrected,
-            "Test_Set_MAE": mae_test,
-            "Test_Set_RMSE": rmse_test,
-            "IoU_Accuracy": iou_accuracy
-        },
-        "plot_image_base64": image_base64
+    return {
+        "model": model,
+        "df": df,
+        "mae_test": mae_test,
+        "rmse_test": rmse_test,
+        "mae_corr": mae_corr,
+        "rmse_corr": rmse_corr,
+        "iou_accuracy": iou_accuracy
     }
-    return results
 
 
-# ========================================
-# C) ROUTES
-# ========================================
+# -----------------------------------------------------------------------------
+# 5) Counting Unique Datasets
+# -----------------------------------------------------------------------------
+def get_number_of_datasets():
+    """
+    Find how many distinct dataset_ids are present across either accel or true data.
+    If both collections store the same dataset_ids, you can just check one.
+    But let's check union from both for clarity.
+    """
+    accel_ids = accel_collection.distinct("dataset_id")
+    true_ids  = true_collection.distinct("dataset_id")
 
+    # The union of both sets:
+    all_ids = set(accel_ids).union(set(true_ids))
+    return len(all_ids)
+
+
+# -----------------------------------------------------------------------------
+# 6) /process Endpoint: Upload CSVs, Insert, Re-Train on *All* Data
+# -----------------------------------------------------------------------------
 @app.route('/process', methods=['POST'])
 def process_endpoint():
-    """
-    Train the model with acceleration + true velocity, compute IoU, optionally save model.
-    Returns metrics + base64 plot.
-    """
+    global saved_model
     if 'acceleration_file' not in request.files or 'true_velocity_file' not in request.files:
-        return jsonify({"error": "Please provide both 'acceleration_file' and 'true_velocity_file'"}), 400
+        return jsonify({"error": "Please provide acceleration_file + true_velocity_file"}), 400
 
     accel_file = request.files['acceleration_file']
-    true_file = request.files['true_velocity_file']
+    true_file  = request.files['true_velocity_file']
 
     if accel_file.filename == '' or true_file.filename == '':
         return jsonify({"error": "No selected file"}), 400
 
     try:
-        accel_df = pd.read_csv(io.StringIO(accel_file.stream.read().decode("UTF8")), low_memory=False)
-        true_df = pd.read_csv(io.StringIO(true_file.stream.read().decode("UTF8")), low_memory=False)
+        # 1) Read CSVs
+        accel_df = pd.read_csv(io.StringIO(accel_file.read().decode("utf-8")), low_memory=False)
+        true_df  = pd.read_csv(io.StringIO(true_file.read().decode("utf-8")),  low_memory=False)
 
+        # 2) Lowercase columns
         accel_df.columns = accel_df.columns.str.lower()
-        true_df.columns = true_df.columns.str.lower()
+        true_df.columns  = true_df.columns.str.lower()
 
+        # 3) Quick column checks
         required_accel = ['ax (m/s^2)', 'ay (m/s^2)', 'az (m/s^2)', 'time']
-        missing_accel = [c for c in required_accel if c not in accel_df.columns]
+        missing_accel  = [c for c in required_accel if c not in accel_df.columns]
         if missing_accel:
-            return jsonify({"error": f"Missing columns in acceleration dataset: {missing_accel}"}), 400
+            return jsonify({"error": f"Missing columns in acceleration: {missing_accel}"}), 400
 
         required_true = ['time', 'speed']
-        missing_true = [c for c in required_true if c not in true_df.columns]
+        missing_true  = [c for c in required_true if c not in true_df.columns]
         if missing_true:
-            return jsonify({"error": f"Missing columns in true velocity dataset: {missing_true}"}), 400
+            return jsonify({"error": f"Missing columns in true velocity: {missing_true}"}), 400
 
-        results = process_data(accel_df, true_df)
-        return jsonify(results), 200
+        # 4) Generate dataset_id
+        dataset_id = str(uuid.uuid4())
+
+        # 5) Insert to Mongo
+        store_csv_in_mongo(accel_collection, accel_df, dataset_id, tag_name="accel")
+        store_csv_in_mongo(true_collection,  true_df,  dataset_id, tag_name="true")
+
+        # 6) Re-Train on *all* data from Mongo
+        result = train_on_all_data()
+        model  = result["model"]
+        df     = result["df"]
+        iou    = result["iou_accuracy"]
+
+        # 7) If IoU≥95%, save model
+        if iou >= 95.0:
+            joblib.dump(model, MODEL_FILENAME)
+            saved_model = model
+            print(f"Model saved (IoU≥95%).")
+
+        # 8) Create a plot
+        plt.figure(figsize=(10,6))
+        plt.plot(df['time'], df['true_velocity'], label='True Velocity', linestyle='--')
+        plt.plot(df['time'], df['velocity'],      label='Calculated Velocity')
+        plt.plot(df['time'], df['corrected_velocity'], label='Corrected Velocity')
+        plt.xlabel('Time')
+        plt.ylabel('Velocity')
+        plt.title('Velocity Comparison (All Data in Mongo)')
+        plt.legend()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        image_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+        plt.close()
+
+        # 9) Acknowledgment: how many total datasets do we have now?
+        num_datasets = get_number_of_datasets()
+        ack_message  = f"Trained on {num_datasets} total dataset(s) so far."
+
+        # 10) Build response
+        response = {
+            "acknowledgment": ack_message,
+            "model_evaluation": {
+                "Test_Set_MAE":  result["mae_test"],
+                "Test_Set_RMSE": result["rmse_test"],
+                "Corrected_Velocity_MAE": result["mae_corr"],
+                "Corrected_Velocity_RMSE": result["rmse_corr"],
+                "IoU_Accuracy": iou
+            },
+            "plot_image_base64": image_base64
+        }
+        return jsonify(response), 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
+# -----------------------------------------------------------------------------
+# 7) /predict Endpoint: Only Acceleration, Use the Saved Model
+# -----------------------------------------------------------------------------
 @app.route('/predict', methods=['POST'])
 def predict_endpoint():
-    """
-    Use the saved model (if available) to predict corrected velocity from acceleration only.
-    Returns only the AVERAGE corrected velocity.
-    """
     global saved_model
     if 'acceleration_file' not in request.files:
         return jsonify({"error": "Please provide 'acceleration_file'"}), 400
@@ -276,37 +352,34 @@ def predict_endpoint():
         return jsonify({"error": "No selected file"}), 400
 
     try:
-        # Try loading the model if not already loaded
+        # If we haven't loaded the model yet, try now
         if not saved_model and os.path.exists(MODEL_FILENAME):
             saved_model = joblib.load(MODEL_FILENAME)
-
         if not saved_model:
-            return jsonify({"error": "No saved model found. Please train first (IoU≥95%)."}), 400
+            return jsonify({"error": "No saved model found (Train first with IoU≥95%)."}), 400
 
-        # Read acceleration
-        accel_df = pd.read_csv(io.StringIO(accel_file.stream.read().decode("UTF8")), low_memory=False)
+        # Read CSV
+        accel_df = pd.read_csv(io.StringIO(accel_file.read().decode("utf-8")), low_memory=False)
         accel_df.columns = accel_df.columns.str.lower()
 
         required_accel = ['ax (m/s^2)', 'ay (m/s^2)', 'az (m/s^2)', 'time']
-        missing_accel = [c for c in required_accel if c not in accel_df.columns]
+        missing_accel  = [c for c in required_accel if c not in accel_df.columns]
         if missing_accel:
-            return jsonify({"error": f"Missing columns in acceleration dataset: {missing_accel}"}), 400
+            return jsonify({"error": f"Missing columns in acceleration: {missing_accel}"}), 400
 
-        # Integrate acceleration
+        # Integrate
         accel_df = preprocess_acceleration_to_velocity(accel_df)
+        X = accel_df[['time', 'velocity']].values
 
-        # Predict corrections
-        time_col = 'time'
-        calc_v_col = 'velocity'
-        X = accel_df[[time_col, calc_v_col]].values
+        # Predict correction
         predicted_correction = saved_model.predict(X)
-        corrected_velocity = accel_df[calc_v_col] + predicted_correction
+        corrected_velocity   = accel_df['velocity'] + predicted_correction
 
-        # Return only the average corrected velocity
+        # Return average corrected velocity
         avg_corrected_vel = float(corrected_velocity.mean())
 
         return jsonify({
-            "message": "Predicted corrected velocity using saved model.",
+            "message": "Predicted corrected velocity using the saved model.",
             "average_corrected_velocity": avg_corrected_vel
         }), 200
 
@@ -314,173 +387,143 @@ def predict_endpoint():
         return jsonify({"error": str(e)}), 500
 
 
+# -----------------------------------------------------------------------------
+# 8) Basic HTML: /upload route with two forms (Train & Predict)
+# -----------------------------------------------------------------------------
 @app.route('/upload', methods=['GET'])
 def upload_page():
-    """
-    A single page with 2 forms:
-      1) Train (acceleration + true velocity) -> /process
-      2) Predict (acceleration only) -> /predict
-    """
     html_content = """
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <title>Velocity Processing & Permanent Model</title>
-        <!-- Bootstrap 5 CSS (CDN) -->
-        <link 
-            rel="stylesheet" 
-            href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css"
-        >
+        <title>Velocity Processing (Mongo + All Data Retained)</title>
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
         <style>
-            body {
-                margin-top: 40px;
-                margin-bottom: 40px;
-            }
-            .results-block {
-                margin-top: 1rem;
-                padding: 1rem;
-                border: 1px solid #ccc;
-            }
-            .plot-img {
-                max-width: 100%;
-                border: 1px solid #dee2e6;
-                margin-top: 10px;
-            }
+            body { margin: 40px; }
+            .results { margin-top: 20px; border: 1px solid #ccc; padding: 15px; }
+            .plot-img { max-width: 100%; margin-top: 10px; border: 1px solid #ccc; }
         </style>
     </head>
     <body>
         <div class="container">
-            <h1 class="text-primary mb-4">Velocity Processing & Permanent Model</h1>
-            <p>1) Train with acceleration &amp; true velocity (<code>/process</code>).
-               If IoU &ge; 95%, model is saved. Then you can do inference with only acceleration (<code>/predict</code>).
+            <h1 class="text-primary mb-4">Velocity Processing with MongoDB (Cumulative Training)</h1>
+            <p>
+              1) Each new dataset is stored in Mongo with a unique dataset_id.<br/>
+              2) We train on <strong>all</strong> data in Mongo each time, so old data is never lost.<br/>
+              3) If IoU ≥ 95%, the model is saved locally. Then you can do /predict with only acceleration.
             </p>
-            <div class="alert alert-info">
-              <strong>Note:</strong> Heroku’s filesystem is ephemeral. The saved model may vanish upon dyno restart.
-            </div>
 
             <div class="row">
-                <!-- Training Form -->
+                <!-- Train Form -->
                 <div class="col-md-6">
-                    <div class="card mb-4 shadow-sm">
-                        <div class="card-body">
-                            <h4 class="card-title">Train/Retrain Model</h4>
-                            <form id="trainForm" method="POST" enctype="multipart/form-data">
-                                <div class="mb-3">
-                                    <label class="form-label">Acceleration CSV:</label>
-                                    <input type="file" name="acceleration_file" class="form-control" required />
-                                </div>
-                                <div class="mb-3">
-                                    <label class="form-label">True Velocity CSV:</label>
-                                    <input type="file" name="true_velocity_file" class="form-control" required />
-                                </div>
-                                <button type="submit" class="btn btn-primary">Train</button>
-                            </form>
-                            <div id="trainResults" class="results-block" style="display: none;"></div>
-                        </div>
+                    <div class="card p-3 mb-4">
+                        <h3>Train on New Dataset</h3>
+                        <form id="trainForm" method="POST" enctype="multipart/form-data">
+                            <div class="mb-3">
+                                <label class="form-label">Acceleration CSV:</label>
+                                <input type="file" name="acceleration_file" class="form-control" required />
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">True Velocity CSV:</label>
+                                <input type="file" name="true_velocity_file" class="form-control" required />
+                            </div>
+                            <button type="submit" class="btn btn-primary">Train</button>
+                        </form>
+                        <div id="trainResults" class="results" style="display:none;"></div>
                     </div>
                 </div>
 
                 <!-- Predict Form -->
                 <div class="col-md-6">
-                    <div class="card mb-4 shadow-sm">
-                        <div class="card-body">
-                            <h4 class="card-title">Predict (Average Velocity)</h4>
-                            <form id="predictForm" method="POST" enctype="multipart/form-data">
-                                <div class="mb-3">
-                                    <label class="form-label">Acceleration CSV:</label>
-                                    <input type="file" name="acceleration_file" class="form-control" required />
-                                </div>
-                                <button type="submit" class="btn btn-success">Predict</button>
-                            </form>
-                            <div id="predictResults" class="results-block" style="display: none;"></div>
-                        </div>
+                    <div class="card p-3 mb-4">
+                        <h3>Predict (Saved Model)</h3>
+                        <form id="predictForm" method="POST" enctype="multipart/form-data">
+                            <div class="mb-3">
+                                <label class="form-label">Acceleration CSV:</label>
+                                <input type="file" name="acceleration_file" class="form-control" required />
+                            </div>
+                            <button type="submit" class="btn btn-success">Predict</button>
+                        </form>
+                        <div id="predictResults" class="results" style="display:none;"></div>
                     </div>
                 </div>
             </div>
         </div>
 
-        <!-- Optional Bootstrap JS -->
-        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-
-        <!-- Inline JS to handle form submissions via fetch -->
         <script>
-            const trainForm = document.getElementById('trainForm');
-            const trainResultsDiv = document.getElementById('trainResults');
-            trainForm.addEventListener('submit', async (e) => {
-                e.preventDefault();
-                trainResultsDiv.style.display = 'block';
-                trainResultsDiv.innerHTML = '<b>Training...</b>';
+        const trainForm = document.getElementById('trainForm');
+        const trainResultsDiv = document.getElementById('trainResults');
+        trainForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            trainResultsDiv.style.display = 'block';
+            trainResultsDiv.innerHTML = '<b>Training on all data... please wait.</b>';
 
-                const formData = new FormData(trainForm);
-                const response = await fetch('/process', {
-                    method: 'POST',
-                    body: formData
-                });
-                const data = await response.json();
-
-                if (!response.ok && data.error) {
-                    trainResultsDiv.innerHTML = '<div class="text-danger">Error: ' + data.error + '</div>';
-                } else {
-                    let html = '';
-                    if (data.average_velocities_on_test_dataset) {
-                        const avgData = data.average_velocities_on_test_dataset;
-                        html += '<h5>Average Velocities on Test Dataset</h5>';
-                        html += '<p>Average Corrected Velocity: ' + avgData.Average_Corrected_Velocity.toFixed(3) + '</p>';
-                        html += '<p>Average True Velocity: ' + avgData.Average_True_Velocity.toFixed(3) + '</p>';
-                        html += '<p>Difference (Corrected vs True): ' + avgData.Difference_Corrected_vs_True.toFixed(3) + '</p>';
-                    }
-                    if (data.model_evaluation) {
-                        const evalData = data.model_evaluation;
-                        html += '<h5>Model Evaluation</h5>';
-                        html += '<p>Corrected Velocity MAE: ' + evalData.Corrected_Velocity_MAE.toFixed(3) + '</p>';
-                        html += '<p>Corrected Velocity RMSE: ' + evalData.Corrected_Velocity_RMSE.toFixed(3) + '</p>';
-                        html += '<p>Test Set MAE: ' + evalData.Test_Set_MAE.toFixed(3) + '</p>';
-                        html += '<p>Test Set RMSE: ' + evalData.Test_Set_RMSE.toFixed(3) + '</p>';
-                        html += '<p>IoU Accuracy: ' + evalData.IoU_Accuracy.toFixed(3) + '%</p>';
-                    }
-                    if (data.plot_image_base64) {
-                        html += '<h5>Plot:</h5>';
-                        html += '<img class="plot-img" src="data:image/png;base64,' + data.plot_image_base64 + '"/>';
-                    }
-                    trainResultsDiv.innerHTML = html;
-                }
+            const formData = new FormData(trainForm);
+            const response = await fetch('/process', {
+                method: 'POST',
+                body: formData
             });
+            const data = await response.json();
 
-            const predictForm = document.getElementById('predictForm');
-            const predictResultsDiv = document.getElementById('predictResults');
-            predictForm.addEventListener('submit', async (e) => {
-                e.preventDefault();
-                predictResultsDiv.style.display = 'block';
-                predictResultsDiv.innerHTML = '<b>Predicting...</b>';
-
-                const formData = new FormData(predictForm);
-                const response = await fetch('/predict', {
-                    method: 'POST',
-                    body: formData
-                });
-                const data = await response.json();
-
-                if (!response.ok && data.error) {
-                    predictResultsDiv.innerHTML = '<div class="text-danger">Error: ' + data.error + '</div>';
-                } else {
-                    // Only average_corrected_velocity is returned
-                    let html = '<h5>Prediction Result</h5>';
-                    html += '<p><strong>Average Corrected Velocity:</strong> ' + data.average_corrected_velocity.toFixed(3) + '</p>';
-                    predictResultsDiv.innerHTML = html;
+            if (!response.ok && data.error) {
+                trainResultsDiv.innerHTML = '<div class="text-danger">Error: ' + data.error + '</div>';
+            } else {
+                let html = '';
+                if (data.acknowledgment) {
+                    html += '<h5>' + data.acknowledgment + '</h5>';
                 }
+                if (data.model_evaluation) {
+                    const evalData = data.model_evaluation;
+                    html += '<h5>Model Evaluation</h5>';
+                    html += '<p>Test Set MAE: ' + evalData.Test_Set_MAE.toFixed(3) + '</p>';
+                    html += '<p>Test Set RMSE: ' + evalData.Test_Set_RMSE.toFixed(3) + '</p>';
+                    html += '<p>Corrected Vel. MAE: ' + evalData.Corrected_Velocity_MAE.toFixed(3) + '</p>';
+                    html += '<p>Corrected Vel. RMSE: ' + evalData.Corrected_Velocity_RMSE.toFixed(3) + '</p>';
+                    html += '<p>IoU Accuracy: ' + evalData.IoU_Accuracy.toFixed(3) + '%</p>';
+                }
+                if (data.plot_image_base64) {
+                    html += '<h5>Plot:</h5>';
+                    html += '<img class="plot-img" src="data:image/png;base64,' + data.plot_image_base64 + '"/>';
+                }
+                trainResultsDiv.innerHTML = html;
+            }
+        });
+
+        const predictForm = document.getElementById('predictForm');
+        const predictResultsDiv = document.getElementById('predictResults');
+        predictForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            predictResultsDiv.style.display = 'block';
+            predictResultsDiv.innerHTML = '<b>Predicting with saved model...</b>';
+
+            const formData = new FormData(predictForm);
+            const response = await fetch('/predict', {
+                method: 'POST',
+                body: formData
             });
+            const data = await response.json();
+
+            if (!response.ok && data.error) {
+                predictResultsDiv.innerHTML = '<div class="text-danger">Error: ' + data.error + '</div>';
+            } else {
+                let html = '<h5>Prediction Result</h5>';
+                html += '<p>Average Corrected Velocity: ' + data.average_corrected_velocity.toFixed(3) + '</p>';
+                predictResultsDiv.innerHTML = html;
+            }
+        });
         </script>
     </body>
     </html>
     """
     return render_template_string(html_content)
 
+
 @app.route('/', methods=['GET'])
 def index():
     return """
-    <h1 class="text-center">Welcome to Velocity Processing!</h1>
-    <p class="text-center"><a href="/upload">Go to Upload Page</a></p>
+    <h1>Welcome to Velocity Processing (Mongo + All Data Retained)!</h1>
+    <p><a href="/upload">Go to Upload Page</a></p>
     """
 
 if __name__ == '__main__':
