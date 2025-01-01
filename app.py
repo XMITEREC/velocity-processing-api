@@ -33,7 +33,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # MongoDB Configuration
-MONGODB_URI = os.getenv('MONGODB_URI')
+MONGODB_URI = os.getenv('mongodb+srv://herokuUser:12345@cluster0.jhaoh.mongodb.net/velocity_db?retryWrites=true&w=majority&appName=Cluster0')
 if not MONGODB_URI:
     logger.error("MONGODB_URI environment variable not set.")
     raise EnvironmentError("MONGODB_URI environment variable not set.")
