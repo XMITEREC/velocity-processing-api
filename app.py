@@ -13,7 +13,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 from math import sqrt
 import joblib  # For saving/loading the model
 from pymongo import MongoClient, ASCENDING
-from gridfs import GridFS
+import gridfs
 from bson.objectid import ObjectId
 
 app = Flask(__name__)
@@ -26,7 +26,7 @@ app = Flask(__name__)
 MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://herokuUser:12345@cluster0.jhaoh.mongodb.net/velocity_db?retryWrites=true&w=majority&appName=Cluster0')
 client = MongoClient(MONGODB_URI)
 db = client['velocity_db']
-fs = GridFS(db)
+fs = gridfs.GridFS(db)
 
 # Collections
 models_collection = db['models']
@@ -43,6 +43,9 @@ saved_model = None
 # ==============================
 
 def load_model():
+    """
+    Load the saved model from MongoDB using GridFS.
+    """
     global saved_model
     if saved_model is None:
         model_doc = models_collection.find_one({'model_name': 'velocity_corrector'})
@@ -60,6 +63,9 @@ def load_model():
     return saved_model
 
 def save_model(model):
+    """
+    Save the trained model to MongoDB using GridFS.
+    """
     # Serialize the model
     model_data = joblib.dumps(model)
     # Delete existing model if any
@@ -138,6 +144,10 @@ def preprocess_true_velocity(df_true, df_accel, time_col='time', speed_col='spee
     return df_merged[['time', 'true_velocity']]
 
 def process_data(accel_df, true_df):
+    """
+    Process the uploaded acceleration and true velocity data, train the model,
+    evaluate it, and generate a visualization.
+    """
     # 1) Integrate acceleration
     accel_df = preprocess_acceleration_to_velocity(accel_df)
 
@@ -157,7 +167,7 @@ def process_data(accel_df, true_df):
     # 4) Retrieve Master Dataset from MongoDB
     master_dfs = []
     for dataset in training_datasets_collection.find().sort('upload_time', ASCENDING):
-        dataset_df = pd.read_json(dataset['data'])
+        dataset_df = pd.read_json(dataset['data'], orient='split')
         master_dfs.append(dataset_df)
     if master_dfs:
         master_df = pd.concat(master_dfs, ignore_index=True)
