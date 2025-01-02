@@ -1,699 +1,505 @@
-# app.py
-
 import os
 import io
 import base64
+import boto3
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use('Agg')  # For Heroku or any headless server
 import matplotlib.pyplot as plt
 
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify
+from dotenv import load_dotenv
+from urllib.parse import urlparse
 from math import sqrt
-import joblib
-import logging
-
-from pymongo import MongoClient, ASCENDING
-from pymongo.errors import PyMongoError
-import gridfs
-
-from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+# If needed, from sklearn.model_selection import train_test_split
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
-logger = logging.getLogger(__name__)
+# -----------------------------
+# Load environment variables
+# -----------------------------
+load_dotenv("variables.env")  # Make sure this file is present.
+
+ACCELERATION_DATA_S3_PATH = os.getenv("ACCELERATION_DATA_S3_PATH")
+VELOCITY_DATA_S3_PATH = os.getenv("VELOCITY_DATA_S3_PATH")
+MASTER_DATASET_S3_PATH = os.getenv("MASTER_DATASET_PATH")  # e.g. s3://yourbucket/MasterDataset/
+
+# Temporary local paths
+LOCAL_ACCEL_PATH = "/tmp/new_accel_data.csv"
+LOCAL_VELOCITY_PATH = "/tmp/new_velocity_data.csv"
+LOCAL_MASTER_PATH = "/tmp/MasterDataset.csv"
 
 app = Flask(__name__)
 
-################################################################################
-# 1) MONGODB SETUP
-################################################################################
+# ---------------------------------------------------------
+# Helpers: S3, Parsing, etc.
+# ---------------------------------------------------------
+def parse_s3_path(s3_path):
+    """Parse S3 path into (bucket, prefix)."""
+    parsed = urlparse(s3_path)
+    if parsed.scheme != 's3':
+        raise ValueError(f"Invalid S3 path: {s3_path}")
+    bucket = parsed.netloc
+    prefix = parsed.path.lstrip('/')
+    return bucket, prefix
 
-MONGODB_URI = os.getenv('MONGODB_URI')
-
-if not MONGODB_URI:
-    logger.error("MONGODB_URI environment variable not set.")
-    raise EnvironmentError("MONGODB_URI environment variable not set.")
-
-try:
-    client = MongoClient(MONGODB_URI)
-    db = client['velocity_db']
-    datasets_collection = db['datasets']
-    fs = gridfs.GridFS(db)
-    logger.info("Connected to MongoDB.")
-except PyMongoError as e:
-    logger.error(f"Failed to connect to MongoDB: {str(e)}")
-    raise e
-
-################################################################################
-# 2) MODEL MANAGEMENT
-################################################################################
-
-MODEL_FILENAME = "model.pkl"
-MODEL_FILE_ALIAS = "current_model"
-
-def load_model():
-    """
-    Load the latest model from GridFS.
-    Returns the model if found, else None.
-    """
+def s3_file_exists(s3_client, bucket, key):
+    """Check if file/key exists in S3."""
     try:
-        file = fs.find_one({"filename": MODEL_FILE_ALIAS})
-        if file:
-            model = joblib.load(io.BytesIO(file.read()))
-            logger.info("Loaded saved model from MongoDB.")
-            return model
-        else:
-            logger.info("No saved model found in MongoDB.")
-            return None
-    except PyMongoError as e:
-        logger.error(f"Error loading model from MongoDB: {str(e)}")
-        return None
-    except Exception as e:
-        logger.error(f"Error deserializing model: {str(e)}")
-        return None
+        s3_client.head_object(Bucket=bucket, Key=key)
+        return True
+    except:
+        return False
 
-def save_model(model):
+def download_s3_file(s3_client, bucket, key, local_path):
+    """Download from S3 to local path."""
+    s3_client.download_file(bucket, key, local_path)
+
+def upload_s3_file(s3_client, local_path, bucket, key):
+    """Upload local file to S3."""
+    s3_client.upload_file(local_path, bucket, key)
+
+# ---------------------------------------------------------
+# Master Dataset Load/Save
+# ---------------------------------------------------------
+def load_master_dataset_from_s3(s3_client, master_s3_path):
     """
-    Save the model to GridFS, overwriting the existing model.
+    Download MasterDataset.csv if it exists; otherwise, return empty DataFrame.
     """
-    try:
-        # Remove existing model
-        existing_files = fs.find({"filename": MODEL_FILE_ALIAS})
-        for f in existing_files:
-            fs.delete(f._id)
-        
-        # Serialize and save the new model
-        model_bytes = io.BytesIO()
-        joblib.dump(model, model_bytes)
-        model_bytes.seek(0)
-        fs.put(model_bytes, filename=MODEL_FILE_ALIAS)
-        logger.info("Saved new model to MongoDB.")
-    except PyMongoError as e:
-        logger.error(f"Error saving model to MongoDB: {str(e)}")
-    except Exception as e:
-        logger.error(f"Error serializing model: {str(e)}")
+    bucket, prefix = parse_s3_path(master_s3_path)
+    if prefix.endswith('/'):
+        prefix += "MasterDataset.csv"
+    master_key = prefix
 
-# Initialize saved_model
-saved_model = load_model()
+    if s3_file_exists(s3_client, bucket, master_key):
+        download_s3_file(s3_client, bucket, master_key, LOCAL_MASTER_PATH)
+        df_master = pd.read_csv(LOCAL_MASTER_PATH)
+    else:
+        df_master = pd.DataFrame(
+            columns=['time','ax','ay','az','true_velocity','dataset_id']
+        )
+    return df_master, bucket, master_key
 
-################################################################################
-# 3) DATA RETENTION SETTINGS
-################################################################################
+def save_master_dataset_to_s3(s3_client, df_master, bucket, key):
+    df_master.to_csv(LOCAL_MASTER_PATH, index=False)
+    upload_s3_file(s3_client, LOCAL_MASTER_PATH, bucket, key)
 
-MAX_DATASETS = 100  # Maximum number of datasets to retain
+# ---------------------------------------------------------
+# Data Preprocessing
+# ---------------------------------------------------------
+def preprocess_acceleration_to_velocity(df, time_col='time', ax_col='ax', ay_col='ay', az_col='az'):
+    """Convert acceleration data to velocity with rolling spike smoothing."""
+    df = df.sort_values(by=time_col).reset_index(drop=True)
 
-def manage_dataset_threshold():
-    """
-    Ensure that the number of datasets does not exceed MAX_DATASETS.
-    If it does, delete the oldest datasets.
-    """
-    try:
-        total_datasets = datasets_collection.count_documents({})
-        if total_datasets > MAX_DATASETS:
-            excess = total_datasets - MAX_DATASETS
-            oldest_datasets = datasets_collection.find().sort("upload_time", ASCENDING).limit(excess)
-            ids_to_delete = [ds['_id'] for ds in oldest_datasets]
-            datasets_collection.delete_many({'_id': {'$in': ids_to_delete}})
-            logger.info(f"Deleted {excess} old dataset(s) to maintain the threshold.")
-    except PyMongoError as e:
-        logger.error(f"Error managing dataset threshold: {str(e)}")
+    # Rolling mean & std for dynamic outlier detection
+    df['ax_rm'] = df[ax_col].rolling(window=5, center=True).mean()
+    df['ay_rm'] = df[ay_col].rolling(window=5, center=True).mean()
+    df['az_rm'] = df[az_col].rolling(window=5, center=True).mean()
 
-################################################################################
-# 4) HELPER FUNCTIONS: Accel->Velocity, True Velocity Expansion, IoU, etc.
-################################################################################
+    df['ax_rs'] = df[ax_col].rolling(window=5, center=True).std().fillna(0)
+    df['ay_rs'] = df[ay_col].rolling(window=5, center=True).std().fillna(0)
+    df['az_rs'] = df[az_col].rolling(window=5, center=True).std().fillna(0)
 
-def remove_spikes_and_integrate(df,
-                                time_col='time',
-                                ax_col='ax (m/s^2)',
-                                ay_col='ay (m/s^2)',
-                                az_col='az (m/s^2)'):
-    """
-    1) Remove spikes using rolling mean ±3*std
-    2) Integrate acceleration -> velocity
-    """
-    # Ensure required columns exist
-    required_cols = [time_col, ax_col, ay_col, az_col]
-    for col in required_cols:
-        if col not in df.columns:
-            raise ValueError(f"Missing required column: {col}")
-    
-    # Rolling means
-    df['ax_mean'] = df[ax_col].rolling(window=5, center=True).mean()
-    df['ay_mean'] = df[ay_col].rolling(window=5, center=True).mean()
-    df['az_mean'] = df[az_col].rolling(window=5, center=True).mean()
+    std_multiplier = 3
+    for col, rm, rs in zip([ax_col, ay_col, az_col], ['ax_rm','ay_rm','az_rm'], ['ax_rs','ay_rs','az_rs']):
+        df[col] = np.where(
+            abs(df[col] - df[rm]) > std_multiplier * df[rs],
+            df[rm],
+            df[col]
+        )
 
-    # Rolling std
-    df['ax_std'] = df[ax_col].rolling(window=5, center=True).std().fillna(0)
-    df['ay_std'] = df[ay_col].rolling(window=5, center=True).std().fillna(0)
-    df['az_std'] = df[az_col].rolling(window=5, center=True).std().fillna(0)
+    df.drop(columns=['ax_rm','ay_rm','az_rm','ax_rs','ay_rs','az_rs'], inplace=True)
 
-    factor = 3
-    for col, mcol, scol in zip([ax_col, ay_col, az_col],
-                               ['ax_mean','ay_mean','az_mean'],
-                               ['ax_std','ay_std','az_std']):
-        df[col] = np.where(abs(df[col] - df[mcol]) > factor*df[scol],
-                           df[mcol],
-                           df[col])
-
-    # Drop temp
-    df.drop(columns=['ax_mean','ay_mean','az_mean','ax_std','ay_std','az_std'], inplace=True)
-
-    # Integrate
+    # Integrate to get velocity
     df['time_diff'] = df[time_col].diff().fillna(0)
-    df['velocity'] = 0.0  # Initialize velocity column
+    velocity = [0.0]
+    for i in range(1, len(df)):
+        ax_i = df.loc[i, ax_col]
+        ay_i = df.loc[i, ay_col]
+        az_i = df.loc[i, az_col]
+        dt = df.loc[i, 'time_diff']
 
-    # Use cumulative sum for integration
-    # Choose dominant axis or total magnitude
-    accel = df.apply(lambda row: get_dominant_accel(row[ax_col], row[ay_col], row[az_col]), axis=1)
-    df['velocity'] = (accel * df['time_diff']).cumsum()
+        # Choose dominant or magnitude
+        if abs(ax_i) > abs(ay_i) and abs(ax_i) > abs(az_i):
+            accel = ax_i
+        elif abs(ay_i) > abs(ax_i) and abs(ay_i) > abs(az_i):
+            accel = ay_i
+        elif abs(az_i) > abs(ax_i) and abs(az_i) > abs(ay_i):
+            accel = az_i
+        else:
+            accel = np.sqrt(ax_i**2 + ay_i**2 + az_i**2)
 
+        velocity.append(velocity[-1] + accel*dt)
+
+    df['calculated_velocity'] = velocity
     return df
 
-def get_dominant_accel(ax, ay, az):
-    """
-    Determine the dominant acceleration axis or total magnitude.
-    """
-    if abs(ax) > abs(ay) and abs(ax) > abs(az):
-        return ax
-    elif abs(ay) > abs(ax) and abs(ay) > abs(az):
-        return ay
-    elif abs(az) > abs(ax) and abs(az) > abs(ay):
-        return az
-    else:
-        return sqrt(ax**2 + ay**2 + az**2)
+def expand_true_velocity(df_true, df_accel, time_col='time', speed_col='speed'):
+    """Expand velocity data to match row count of acceleration."""
+    if df_true.empty:
+        return pd.DataFrame(columns=[time_col, 'true_velocity'])
 
-def expand_true_velocity(df_true, df_accel,
-                         time_col='time',
-                         speed_col='speed'):
-    """
-    Expand the true velocity so it matches number of rows in df_accel
-    by randomizing speeds ±5% between each original point.
-    """
     df_true = df_true[[time_col, speed_col]].copy()
-    n_acc   = len(df_accel)
-    n_true  = len(df_true)
-    if n_true == 0:
-        raise ValueError("True velocity is empty; cannot expand.")
+    df_true.rename(columns={speed_col: 'true_velocity'}, inplace=True)
 
-    if n_true >= n_acc:
-        # If true velocity has more or equal rows, truncate
-        df_true = df_true.iloc[:n_acc]
-        return df_true.rename(columns={'speed': 'true_velocity'})
+    n1 = len(df_accel)
+    n2 = len(df_true)
+    if n2 == 0:
+        return pd.DataFrame(columns=[time_col, 'true_velocity'])
 
-    ratio = n_acc / n_true
-    ratio_minus_1 = int(np.floor(ratio - 1)) if ratio > 1 else 0
+    ratio = n1 / n2
+    expanded_speeds = []
+    ratio_minus_1_int = int(np.floor(ratio - 1)) if ratio > 1 else 0
 
-    speeds = []
-    for i in range(n_true):
-        orig_spd = df_true[speed_col].iloc[i]
-        speeds.append(orig_spd)
-        for _ in range(ratio_minus_1):
-            speeds.append(np.random.uniform(orig_spd * 0.95, orig_spd * 1.05))
+    for i in range(n2):
+        orig_speed = df_true['true_velocity'].iloc[i]
+        expanded_speeds.append(orig_speed)
+        for _ in range(ratio_minus_1_int):
+            expanded_speeds.append(np.random.uniform(orig_speed*0.95, orig_speed*1.05))
 
-    # Fill remainder
-    remainder = n_acc - len(speeds)
+    remainder = n1 - len(expanded_speeds)
     if remainder > 0:
-        last_spd = df_true[speed_col].iloc[-1]
+        last_speed = df_true['true_velocity'].iloc[-1]
         for _ in range(remainder):
-            speeds.append(np.random.uniform(last_spd * 0.95, last_spd * 1.05))
+            expanded_speeds.append(np.random.uniform(last_speed*0.95, last_speed*1.05))
 
-    speeds = speeds[:n_acc]
+    expanded_speeds = expanded_speeds[:n1]
+
     df_expanded = pd.DataFrame({
         time_col: df_accel[time_col].values,
-        'true_velocity': speeds
+        'true_velocity': expanded_speeds
     })
     return df_expanded
 
-def compute_iou(true_vel, corrected_vel):
-    """
-    Compute Intersection over Union (IoU) metric.
-    """
-    min_vals = np.minimum(true_vel, corrected_vel)
-    max_vals = np.maximum(true_vel, corrected_vel)
-    denominator = max_vals.sum()
-    if denominator == 0:
-        return 0.0
-    return (min_vals.sum() / denominator) * 100
+def create_dataset_id(df_master):
+    if df_master.empty:
+        return 1
+    return df_master['dataset_id'].max() + 1
 
-################################################################################
-# 5) TRAINING FUNCTION: Repeated training on all data until IoU≥95 or max loops
-################################################################################
+def merge_into_master(df_accel, df_true_expanded, dataset_id):
+    """Combine into a single DF with columns: time, ax, ay, az, true_velocity, dataset_id."""
+    if 'true_velocity' not in df_true_expanded.columns:
+        # no velocity => all NaN
+        df_merged = pd.DataFrame({
+            'time': df_accel['time'],
+            'ax': df_accel['ax'],
+            'ay': df_accel['ay'],
+            'az': df_accel['az'],
+            'true_velocity': np.nan,
+            'dataset_id': dataset_id
+        })
+    else:
+        df_merged = pd.DataFrame({
+            'time': df_accel['time'],
+            'ax': df_accel['ax'],
+            'ay': df_accel['ay'],
+            'az': df_accel['az'],
+            'true_velocity': df_true_expanded['true_velocity'],
+            'dataset_id': dataset_id
+        })
+    return df_merged
 
-def get_master_dataset():
-    """
-    Retrieve and concatenate all datasets to form the master dataset.
-    Returns a tuple of (full_accel_df, full_true_df)
-    """
-    try:
-        all_datasets = list(datasets_collection.find())
-        if not all_datasets:
-            raise ValueError("No datasets available for training. Please upload first.")
-        
-        # Concatenate acceleration and true velocity data
-        accel_records = []
-        true_records = []
-        for ds in all_datasets:
-            accel_records.extend(ds['acceleration_data'])
-            true_records.extend(ds['true_velocity_data'])
-        
-        full_accel_df = pd.DataFrame(accel_records)
-        full_true_df  = pd.DataFrame(true_records)
-        
-        return full_accel_df, full_true_df
-    except PyMongoError as e:
-        logger.error(f"Error retrieving master dataset: {str(e)}")
-        raise e
+# ---------------------------------------------------------
+# Training
+# ---------------------------------------------------------
+def train_model_on_master(df_master):
+    """Train on all rows that have real velocity (true_velocity != NaN)."""
+    df_trainable = df_master.dropna(subset=['true_velocity']).copy()
+    if df_trainable.empty:
+        return None  # no data to train on
 
-def train_on_all_data(max_loops=5):
-    """
-    Merges all old + new data from MongoDB, trains once, and repeats if IoU<95%
-    up to max_loops times. Returns the final model, DataFrame, metrics, etc.
-    The final plot should only represent the *latest* dataset.
-    """
-    try:
-        full_accel_df, full_true_df = get_master_dataset()
-    except Exception as e:
-        raise e
+    # For each dataset_id, recalc "calculated_velocity"
+    dfs = []
+    for d_id in df_trainable['dataset_id'].unique():
+        subset = df_trainable[df_trainable['dataset_id'] == d_id].copy()
+        subset = preprocess_acceleration_to_velocity(subset)
+        subset['correction'] = subset['true_velocity'] - subset['calculated_velocity']
+        dfs.append(subset)
+    df_trainable = pd.concat(dfs, ignore_index=True)
 
-    # We'll do repeated training loops
-    best_model   = None
-    best_metrics = {}
-    iou_acc      = 0
+    X = df_trainable[['time','calculated_velocity']].values
+    y = df_trainable['correction'].values
+    if len(X) < 2:
+        return None
 
-    for loop_i in range(max_loops):
-        # Step A: Preprocess
-        accel_df_proc = remove_spikes_and_integrate(full_accel_df.copy())
-        true_df_expanded = expand_true_velocity(full_true_df.copy(), accel_df_proc)
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    model.fit(X, y)
+    return model
 
-        # Build combined DF
-        df = pd.DataFrame()
-        df['time']          = accel_df_proc['time']
-        df['velocity']      = accel_df_proc['velocity']
-        df['true_velocity'] = true_df_expanded['true_velocity']
-        df['correction']    = df['true_velocity'] - df['velocity']
+def compute_iou_accuracy(y_true, y_pred):
+    """Intersection over Union style: sum(min) / sum(max)."""
+    min_vals = np.minimum(y_true, y_pred)
+    max_vals = np.maximum(y_true, y_pred)
+    return (np.sum(min_vals) / np.sum(max_vals)) * 100.0
 
-        # Step B: Train
-        X = df[['time','velocity']].values
-        y = df['correction'].values
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+def repeated_training_until_95(df_master, max_iter=5):
+    """Train multiple times if IoU < 95%, up to max_iter. Return the final model."""
+    if df_master['true_velocity'].dropna().empty:
+        # no ground-truth => can't compute IoU, just train once
+        return train_model_on_master(df_master)
 
-        model = RandomForestRegressor(n_estimators=100, random_state=42)
-        model.fit(X_train, y_train)
+    model = None
+    iou_value = 0.0
+    for i in range(1, max_iter+1):
+        model = train_model_on_master(df_master)
+        if not model:
+            break  # no model
 
-        # Evaluate
-        y_test_pred = model.predict(X_test)
-        mae_test  = mean_absolute_error(y_test, y_test_pred)
-        rmse_test = np.sqrt(mean_squared_error(y_test, y_test_pred))
-
-        # Predict on full
-        df['predicted_correction'] = model.predict(X)
-        df['corrected_velocity']   = df['velocity'] + df['predicted_correction']
-
-        mae_corr = mean_absolute_error(df['true_velocity'], df['corrected_velocity'])
-        rmse_corr= np.sqrt(mean_squared_error(df['true_velocity'], df['corrected_velocity']))
-        iou_acc  = compute_iou(df['true_velocity'], df['corrected_velocity'])
-
-        # Assign best_model and best_metrics
-        best_model = model
-        best_metrics = {
-            "df": df,
-            "mae_test": mae_test,
-            "rmse_test": rmse_test,
-            "mae_corr": mae_corr,
-            "rmse_corr": rmse_corr,
-            "iou_acc":  iou_acc
-        }
-
-        # If IoU≥95%, we can break early
-        if iou_acc >= 95.0:
-            logger.info(f"Training loop {loop_i+1}: IoU {iou_acc:.2f}% >= 95%. Stopping training.")
+        # Evaluate IoU on entire master
+        df_eval = df_master[~df_master['true_velocity'].isna()].copy()
+        if df_eval.empty:
             break
-        else:
-            logger.info(f"Training loop {loop_i+1}: IoU {iou_acc:.2f}% < 95%. Continuing training.")
+        # Recalc velocity for each dataset
+        df_list = []
+        for d_id in df_eval['dataset_id'].unique():
+            sub = df_eval[df_eval['dataset_id'] == d_id].copy()
+            sub = preprocess_acceleration_to_velocity(sub)
+            pred_corr = model.predict(sub[['time','calculated_velocity']].values)
+            sub['corrected_velocity'] = sub['calculated_velocity'] + pred_corr
+            df_list.append(sub)
+        df_eval = pd.concat(df_list, ignore_index=True)
 
-    return best_model, best_metrics
+        y_true = df_eval['true_velocity'].values
+        y_pred = df_eval['corrected_velocity'].values
+        iou_value = compute_iou_accuracy(y_true, y_pred)
+        print(f"[Train Iter {i}] IoU = {iou_value:.2f}%")
 
-################################################################################
-# 6) ROUTES
-################################################################################
+        if iou_value >= 95.0:
+            print("Reached IoU >= 95%. Stopping repeated training.")
+            break
 
-@app.route('/process', methods=['POST'])
-def process_endpoint():
+    return model
+
+# ---------------------------------------------------------
+# Pipeline Functions
+# ---------------------------------------------------------
+def run_training_pipeline(accel_path, velocity_path, has_velocity):
     """
-    1) Upload acceleration + true velocity
-    2) Insert into MongoDB
-    3) Retrain on *all* data (old + new) with repeated loops if needed
-    4) Save model if IoU≥95
-    5) Plot only the *new* dataset
-    6) Return acknowledgment & stats
+    1) Read & preprocess data
+    2) Merge into Master
+    3) Retrain model
+    4) Return metrics & base64 plot (if velocity is present)
     """
-    global saved_model
-    if 'acceleration_file' not in request.files or 'true_velocity_file' not in request.files:
-        return jsonify({"error": "Need both acceleration_file and true_velocity_file"}), 400
+    s3_client = boto3.client('s3')
 
-    accel_file = request.files['acceleration_file']
-    true_file  = request.files['true_velocity_file']
-    if accel_file.filename == '' or true_file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
+    # 1) Read Acceleration
+    df_accel = pd.read_csv(accel_path)
+    df_accel.columns = df_accel.columns.str.lower()
+    required_cols = ['time','ax (m/s^2)','ay (m/s^2)','az (m/s^2)']
+    for c in required_cols:
+        if c not in df_accel.columns:
+            raise ValueError("Acceleration CSV missing columns: time, ax (m/s^2), ay (m/s^2), az (m/s^2)")
+    df_accel = df_accel[required_cols].rename(columns={
+        'ax (m/s^2)': 'ax',
+        'ay (m/s^2)': 'ay',
+        'az (m/s^2)': 'az'
+    })
+
+    # 2) Possibly read velocity
+    if has_velocity:
+        df_vel = pd.read_csv(velocity_path)
+        df_vel.columns = df_vel.columns.str.lower()
+        if 'time' not in df_vel.columns or 'speed' not in df_vel.columns:
+            # treat as no velocity
+            df_vel = pd.DataFrame()
+            has_velocity = False
+    else:
+        df_vel = pd.DataFrame()
+
+    # expand velocity if present
+    df_accel_proc = preprocess_acceleration_to_velocity(df_accel.copy())
+    df_vel_expanded = expand_true_velocity(df_vel.copy(), df_accel_proc)
+
+    # 3) Load Master
+    df_master, master_bucket, master_key = load_master_dataset_from_s3(s3_client, MASTER_DATASET_S3_PATH)
+
+    # 4) Create dataset_id & merge
+    new_id = create_dataset_id(df_master)
+    df_new = merge_into_master(df_accel, df_vel_expanded, new_id)
+    df_master = pd.concat([df_master, df_new], ignore_index=True)
+    df_master.drop_duplicates(subset=['time','dataset_id'], inplace=True)
+
+    # 5) Save Master
+    save_master_dataset_to_s3(s3_client, df_master, master_bucket, master_key)
+
+    # 6) Retrain Model
+    model = repeated_training_until_95(df_master, max_iter=5)
+    if model is None:
+        return {"error": "No valid model trained. Possibly no velocity data in entire master."}
+
+    # 7) Evaluate & Plot for the new dataset only
+    df_new_sorted = df_new.sort_values(by='time').reset_index(drop=True)
+    df_new_sorted = preprocess_acceleration_to_velocity(df_new_sorted)
+    predicted_corr = model.predict(df_new_sorted[['time','calculated_velocity']].values)
+    df_new_sorted['corrected_velocity'] = df_new_sorted['calculated_velocity'] + predicted_corr
+
+    # Prepare results
+    results = {}
+    # Make a plot in memory
+    plt.figure(figsize=(8, 5))
+    plt.plot(df_new_sorted['time'], df_new_sorted['corrected_velocity'], label='Corrected Velocity')
+    plt.plot(df_new_sorted['time'], df_new_sorted['calculated_velocity'], label='Calculated Velocity', linestyle='--')
+
+    if not df_new_sorted['true_velocity'].isna().all():
+        # we do have real velocity
+        valid_mask = ~df_new_sorted['true_velocity'].isna()
+        y_true = df_new_sorted.loc[valid_mask, 'true_velocity'].values
+        y_pred = df_new_sorted.loc[valid_mask, 'corrected_velocity'].values
+
+        if len(y_true) >= 2:
+            iou = compute_iou_accuracy(y_true, y_pred)
+            mae = mean_absolute_error(y_true, y_pred)
+            mse = mean_squared_error(y_true, y_pred)
+            rmse = sqrt(mse)
+            results.update({
+                "iou_accuracy": round(iou, 3),
+                "mae": round(mae, 4),
+                "mse": round(mse, 4),
+                "rmse": round(rmse, 4)
+            })
+
+        plt.plot(df_new_sorted['time'], df_new_sorted['true_velocity'], label='True Velocity', linestyle=':')
+
+    plt.title(f"Velocity Comparison (Dataset ID={new_id})")
+    plt.xlabel('Time')
+    plt.ylabel('Velocity (m/s)')
+    plt.legend()
+    plt.tight_layout()
+
+    # Convert plot to base64
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    plot_base64 = base64.b64encode(buf.read()).decode('utf-8')
+    plt.close()
+
+    results["plot_base64"] = plot_base64
+
+    # Additional average velocities
+    avg_calc = df_new_sorted['calculated_velocity'].mean()
+    avg_corr = df_new_sorted['corrected_velocity'].mean()
+    results["avg_calculated_velocity"] = round(float(avg_calc), 3)
+    results["avg_corrected_velocity"] = round(float(avg_corr), 3)
+    if not df_new_sorted['true_velocity'].isna().all():
+        avg_true = df_new_sorted['true_velocity'].mean()
+        results["avg_true_velocity"] = round(float(avg_true), 3)
+        results["difference_corr_vs_true"] = round(float(avg_corr - avg_true), 3)
+
+    return results
+
+def run_prediction_pipeline(accel_path):
+    """
+    1) Use existing trained model from Master (if any).
+    2) Predict on new acceleration data only (no velocity).
+    3) Return corrected velocities + base64 plot.
+    """
+    s3_client = boto3.client('s3')
+
+    # 1) Load Master & train model (only on those with real velocity)
+    df_master, master_bucket, master_key = load_master_dataset_from_s3(s3_client, MASTER_DATASET_S3_PATH)
+    model = repeated_training_until_95(df_master, max_iter=5)
+    if model is None:
+        return {"error": "No valid model trained. Master dataset has no velocity data."}
+
+    # 2) Read new acceleration
+    df_accel = pd.read_csv(accel_path)
+    df_accel.columns = df_accel.columns.str.lower()
+    required_cols = ['time','ax (m/s^2)','ay (m/s^2)','az (m/s^2)']
+    for c in required_cols:
+        if c not in df_accel.columns:
+            raise ValueError("Acceleration CSV missing columns: time, ax (m/s^2), ay (m/s^2), az (m/s^2)")
+    df_accel = df_accel[required_cols].rename(columns={
+        'ax (m/s^2)': 'ax',
+        'ay (m/s^2)': 'ay',
+        'az (m/s^2)': 'az'
+    })
+
+    df_accel_proc = preprocess_acceleration_to_velocity(df_accel.copy())
+    predicted_corr = model.predict(df_accel_proc[['time','calculated_velocity']].values)
+    df_accel_proc['corrected_velocity'] = df_accel_proc['calculated_velocity'] + predicted_corr
+
+    # (Optional) If you want to store these predicted rows in Master with true_velocity=NaN, do so:
+    # new_id = create_dataset_id(df_master)
+    # df_new = merge_into_master(df_accel, pd.DataFrame(), new_id)
+    # save_master_dataset_to_s3(...)  # Caution: you might not want to pollute the dataset.
+
+    # 3) Plot
+    plt.figure(figsize=(8, 5))
+    plt.plot(df_accel_proc['time'], df_accel_proc['corrected_velocity'], label='Corrected Velocity')
+    plt.plot(df_accel_proc['time'], df_accel_proc['calculated_velocity'], label='Calculated Velocity', linestyle='--')
+    plt.title("Velocity Prediction (No Ground Truth)")
+    plt.xlabel('Time')
+    plt.ylabel('Velocity (m/s)')
+    plt.legend()
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    plot_base64 = base64.b64encode(buf.read()).decode('utf-8')
+    plt.close()
+
+    # Return results
+    avg_calc = df_accel_proc['calculated_velocity'].mean()
+    avg_corr = df_accel_proc['corrected_velocity'].mean()
+    return {
+        "plot_base64": plot_base64,
+        "avg_calculated_velocity": round(float(avg_calc), 3),
+        "avg_corrected_velocity": round(float(avg_corr), 3)
+    }
+
+# ---------------------------------------------------------
+# Flask Routes
+# ---------------------------------------------------------
+@app.route('/train', methods=['POST'])
+def train_endpoint():
+    """
+    POST /train
+    Form-data:
+      accel_csv: the acceleration CSV
+      velocity_csv: the velocity CSV (optional)
+    Returns JSON with metrics + base64 plot
+    """
+    accel_file = request.files.get('accel_csv')
+    velocity_file = request.files.get('velocity_csv')
+
+    if not accel_file:
+        return jsonify({"error": "accel_csv file is required"}), 400
+
+    accel_file.save(LOCAL_ACCEL_PATH)
+    has_velocity = False
+    if velocity_file:
+        velocity_file.save(LOCAL_VELOCITY_PATH)
+        has_velocity = True
 
     try:
-        # 1) Read the CSVs
-        accel_df = pd.read_csv(io.StringIO(accel_file.read().decode("utf-8")), low_memory=False)
-        true_df  = pd.read_csv(io.StringIO(true_file.read().decode("utf-8")),  low_memory=False)
-
-        # 2) Lowercase columns
-        accel_df.columns = accel_df.columns.str.lower()
-        true_df.columns  = true_df.columns.str.lower()
-
-        # 3) Check required columns
-        accel_req = ['ax (m/s^2)','ay (m/s^2)','az (m/s^2)','time']
-        missing_accel = [c for c in accel_req if c not in accel_df.columns]
-        if missing_accel:
-            return jsonify({"error": f"Missing columns in acceleration: {missing_accel}"}), 400
-
-        true_req = ['time','speed']
-        missing_true = [c for c in true_req if c not in true_df.columns]
-        if missing_true:
-            return jsonify({"error": f"Missing columns in true velocity: {missing_true}"}), 400
-
-        # 4) Insert into MongoDB
-        dataset = {
-            "acceleration_data": accel_df.to_dict('records'),
-            "true_velocity_data": true_df.to_dict('records'),
-            "upload_time": pd.Timestamp.utcnow()
-        }
-        datasets_collection.insert_one(dataset)
-        logger.info("Inserted new dataset into MongoDB.")
-
-        # 5) Manage dataset threshold
-        manage_dataset_threshold()
-
-        # 6) Train on all data
-        model, metrics = train_on_all_data(max_loops=5)
-        df        = metrics["df"]
-        iou       = metrics["iou_acc"]
-        mae_test  = metrics["mae_test"]
-        rmse_test = metrics["rmse_test"]
-        mae_corr  = metrics["mae_corr"]
-        rmse_corr = metrics["rmse_corr"]
-
-        # 7) If IoU≥95, save
-        if iou >= 95.0:
-            save_model(model)
-            saved_model = model
-            logger.info("Model saved (IoU≥95%).")
-
-        # 8) We only want to plot the NEW dataset, not old ones
-        #    So let's remove spikes & integrate JUST the newly uploaded acceleration,
-        #    expand the newly uploaded true velocity, and generate a fresh df_new
-        new_accel_proc  = remove_spikes_and_integrate(accel_df.copy())
-        new_true_exp    = expand_true_velocity(true_df.copy(), new_accel_proc)
-
-        df_new = pd.DataFrame()
-        df_new['time']          = new_accel_proc['time']
-        df_new['velocity']      = new_accel_proc['velocity']
-        df_new['true_velocity'] = new_true_exp['true_velocity']
-        df_new['correction']    = df_new['true_velocity'] - df_new['velocity']
-
-        # Predict corrections using the *final* model we ended up with
-        if not saved_model:
-            saved_model = model  # If not saved, use the last trained model
-        X_new = df_new[['time','velocity']].values
-        df_new['predicted_correction'] = saved_model.predict(X_new)
-        df_new['corrected_velocity']   = df_new['velocity'] + df_new['predicted_correction']
-
-        # 9) Create the plot for the NEW dataset only
-        plt.figure(figsize=(10,6))
-        plt.plot(df_new['time'], df_new['true_velocity'], label='True Velocity', linestyle='--')
-        plt.plot(df_new['time'], df_new['velocity'],      label='Calculated Velocity')
-        plt.plot(df_new['time'], df_new['corrected_velocity'], label='Corrected Velocity')
-        plt.xlabel('Time')
-        plt.ylabel('Velocity')
-        plt.title('Latest Training - New Dataset Only')
-        plt.legend()
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png')
-        buf.seek(0)
-        image_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-        plt.close()
-
-        # 10) Build final response
-        #    Acknowledge how many total times we've trained
-        total_datasets = datasets_collection.count_documents({})
-        ack_msg = f"Trained on {total_datasets} total dataset(s). IoU final: {iou:.2f}%."
-
-        # Calculate average velocities on the new dataset
-        avg_corrected_velocity = df_new['corrected_velocity'].mean()
-        avg_true_velocity      = df_new['true_velocity'].mean()
-
-        resp = {
-            "acknowledgment": ack_msg,
-            "average_velocities_on_test_dataset": {
-                "Average_Corrected_Velocity": round(avg_corrected_velocity, 3),  
-                "Average_True_Velocity":     round(avg_true_velocity, 3)
-            },
-            "model_evaluation": {
-                "Test_Set_MAE": round(mae_test, 3),
-                "Test_Set_RMSE": round(rmse_test, 3),
-                "Corrected_Velocity_MAE": round(mae_corr, 3),
-                "Corrected_Velocity_RMSE": round(rmse_corr, 3),
-                "IoU_Accuracy": round(iou, 2)
-            },
-            "plot_image_base64": image_b64
-        }
-        return jsonify(resp), 200
-
+        results = run_training_pipeline(LOCAL_ACCEL_PATH, LOCAL_VELOCITY_PATH, has_velocity)
+        if "error" in results:
+            return jsonify(results), 500
+        return jsonify(results), 200
     except Exception as e:
-        logger.error(f"Error in /process endpoint: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/predict', methods=['POST'])
 def predict_endpoint():
     """
-    Only acceleration_file is required.
-    We use the *latest saved model* to predict the average corrected velocity.
+    POST /predict
+    Form-data:
+      accel_csv: the acceleration CSV
+    Returns JSON with predicted velocities + base64 plot
     """
-    global saved_model
-    if 'acceleration_file' not in request.files:
-        return jsonify({"error":"Please provide acceleration_file"}), 400
+    accel_file = request.files.get('accel_csv')
+    if not accel_file:
+        return jsonify({"error": "accel_csv file is required"}), 400
 
-    accel_file = request.files['acceleration_file']
-    if accel_file.filename == '':
-        return jsonify({"error":"No selected file"}), 400
-
+    accel_file.save(LOCAL_ACCEL_PATH)
     try:
-        # If we never loaded or saved a model yet:
-        if not saved_model:
-            saved_model = load_model()
-        if not saved_model:
-            return jsonify({"error":"No saved model found. Please train first."}), 400
-
-        df_accel = pd.read_csv(io.StringIO(accel_file.read().decode("utf-8")), low_memory=False)
-        df_accel.columns = df_accel.columns.str.lower()
-
-        accel_req = ['ax (m/s^2)','ay (m/s^2)','az (m/s^2)','time']
-        missing_accel = [c for c in accel_req if c not in df_accel.columns]
-        if missing_accel:
-            return jsonify({"error":f"Missing columns in acceleration: {missing_accel}"}), 400
-
-        # Preprocess
-        df_accel = remove_spikes_and_integrate(df_accel)
-        X_acc = df_accel[['time','velocity']].values
-
-        # Predict
-        predicted_corr = saved_model.predict(X_acc)
-        corrected_vel  = df_accel['velocity'] + predicted_corr
-
-        avg_corrected_vel = float(corrected_vel.mean())
-
-        return jsonify({
-            "message": "Predicted corrected velocity using the saved model.",
-            "average_corrected_velocity": round(avg_corrected_vel, 3)
-        }), 200
-
+        results = run_prediction_pipeline(LOCAL_ACCEL_PATH)
+        if "error" in results:
+            return jsonify(results), 500
+        return jsonify(results), 200
     except Exception as e:
-        logger.error(f"Error in /predict endpoint: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
-################################################################################
-# 7) FRONTEND ROUTE
-################################################################################
-
-@app.route('/upload', methods=['GET'])
-def upload_page():
-    """
-    Single page with:
-      - Train form (accel + true)
-      - Predict form (accel only)
-    """
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>Velocity Processing with MongoDB Integration</title>
-      <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
-      <style>
-        body { margin: 40px; }
-        .results { margin-top: 20px; border: 1px solid #ccc; padding: 15px; }
-        .plot-img { max-width: 100%; margin-top: 10px; border: 1px solid #ccc; }
-      </style>
-    </head>
-    <body>
-      <div class="container">
-        <h1 class="text-primary mb-4">Velocity Processing with MongoDB Integration</h1>
-        <p>Each time you upload new data, the model accumulates old+new. The final plot shows only the new dataset,
-           but the model is stronger because it has learned from all previous data.</p>
-
-        <div class="row">
-          <!-- Train Form -->
-          <div class="col-md-6">
-            <div class="card p-3 mb-4">
-              <h3>Train</h3>
-              <form id="trainForm" method="POST" enctype="multipart/form-data">
-                <div class="mb-3">
-                  <label>Acceleration CSV</label>
-                  <input type="file" name="acceleration_file" class="form-control" required />
-                </div>
-                <div class="mb-3">
-                  <label>True Velocity CSV</label>
-                  <input type="file" name="true_velocity_file" class="form-control" required />
-                </div>
-                <button type="submit" class="btn btn-primary">Train</button>
-              </form>
-              <div id="trainResults" class="results" style="display:none;"></div>
-            </div>
-          </div>
-
-          <!-- Predict Form -->
-          <div class="col-md-6">
-            <div class="card p-3 mb-4">
-              <h3>Predict</h3>
-              <form id="predictForm" method="POST" enctype="multipart/form-data">
-                <div class="mb-3">
-                  <label>Acceleration CSV</label>
-                  <input type="file" name="acceleration_file" class="form-control" required />
-                </div>
-                <button type="submit" class="btn btn-success">Predict</button>
-              </form>
-              <div id="predictResults" class="results" style="display:none;"></div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <script>
-      const trainForm = document.getElementById('trainForm');
-      const trainResultsDiv = document.getElementById('trainResults');
-      trainForm.addEventListener('submit', async function(e) {
-        e.preventDefault();
-        trainResultsDiv.style.display = 'block';
-        trainResultsDiv.innerHTML = '<b>Training... please wait.</b>';
-
-        const formData = new FormData(trainForm);
-        const response = await fetch('/process', {
-          method: 'POST',
-          body: formData
-        });
-        const data = await response.json();
-
-        if (!response.ok && data.error) {
-          trainResultsDiv.innerHTML = '<div class="text-danger">Error: ' + data.error + '</div>';
-        } else {
-          let html = '';
-          if (data.acknowledgment) {
-            html += '<h4>' + data.acknowledgment + '</h4>';
-          }
-          if (data.average_velocities_on_test_dataset) {
-            const avgData = data.average_velocities_on_test_dataset;
-            html += '<h5>Average Velocities on the New Dataset</h5>';
-            html += '<p>Average Corrected Velocity: ' + avgData.Average_Corrected_Velocity.toFixed(3) + '</p>';
-            html += '<p>Average True Velocity: ' + avgData.Average_True_Velocity.toFixed(3) + '</p>';
-          }
-          if (data.model_evaluation) {
-            const evalData = data.model_evaluation;
-            html += '<h5>Model Evaluation</h5>';
-            html += '<p>Test Set MAE: ' + evalData.Test_Set_MAE.toFixed(3) + '</p>';
-            html += '<p>Test Set RMSE: ' + evalData.Test_Set_RMSE.toFixed(3) + '</p>';
-            html += '<p>Corrected Velocity MAE: ' + evalData.Corrected_Velocity_MAE.toFixed(3) + '</p>';
-            html += '<p>Corrected Velocity RMSE: ' + evalData.Corrected_Velocity_RMSE.toFixed(3) + '</p>';
-            html += '<p>IoU Accuracy: ' + evalData.IoU_Accuracy.toFixed(2) + '%</p>';
-          }
-          if (data.plot_image_base64) {
-            html += '<h5>Plot (New Dataset Only):</h5>';
-            html += '<img class="plot-img" src="data:image/png;base64,' + data.plot_image_base64 + '"/>';
-          }
-          trainResultsDiv.innerHTML = html;
-        }
-      });
-
-      const predictForm = document.getElementById('predictForm');
-      const predictResultsDiv = document.getElementById('predictResults');
-      predictForm.addEventListener('submit', async function(e) {
-        e.preventDefault();
-        predictResultsDiv.style.display = 'block';
-        predictResultsDiv.innerHTML = '<b>Predicting... please wait.</b>';
-
-        const formData = new FormData(predictForm);
-        const response = await fetch('/predict', {
-          method: 'POST',
-          body: formData
-        });
-        const data = await response.json();
-
-        if (!response.ok && data.error) {
-          predictResultsDiv.innerHTML = '<div class="text-danger">Error: ' + data.error + '</div>';
-        } else {
-          let html = '<h5>Prediction Result</h5>';
-          html += '<p>Average Corrected Velocity: ' + data.average_corrected_velocity.toFixed(3) + '</p>';
-          predictResultsDiv.innerHTML = html;
-        }
-      });
-      </script>
-    </body>
-    </html>
-    """
-    return render_template_string(html_content)
-
-@app.route('/', methods=['GET'])
-def index():
-    return """
-    <h1>Welcome to Velocity Processing!</h1>
-    <p><a href="/upload">Go to Upload Page</a></p>
-    """
-
-################################################################################
-# 8) HANDLE /favicon.ico REQUESTS
-################################################################################
-
-@app.route('/favicon.ico')
-def favicon():
-    """
-    Handle favicon.ico requests to prevent 404 errors and application crashes.
-    Returns a 204 No Content response.
-    """
-    return '', 204
-
-################################################################################
-# 9) HANDLE UNKNOWN ROUTES
-################################################################################
-
-@app.errorhandler(404)
-def page_not_found(e):
-    """
-    Handle 404 errors gracefully without crashing the application.
-    """
-    return jsonify({"error": "Resource not found."}), 404
-
-################################################################################
-# 10) APPLICATION ENTRY POINT
-################################################################################
-
-if __name__ == '__main__':
-    # Ensure that the model is loaded or exists
-    if not saved_model:
-        logger.warning("No saved model found. Please train the model by uploading datasets.")
-    app.run(debug=False)  # Set debug=False for production
+# Uncomment for local debugging:
+# if __name__ == "__main__":
+#     app.run(host="0.0.0.0", port=5000, debug=True)
