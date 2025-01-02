@@ -30,7 +30,8 @@ logger = logging.getLogger(__name__)
 
 # Initialize Flask App
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'a_very_secure_and_random_secret_key'  # Replace with a strong secret key
+# Retrieve SECRET_KEY from environment variables, with a default fallback (useful for development)
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'a_very_secure_and_random_secret_key')  # Replace with a strong secret key in production
 
 # Initialize CSRF Protection
 csrf = CSRFProtect(app)
@@ -43,7 +44,7 @@ def allowed_file(filename):
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 # Initialize MongoDB Client
-MONGODB_URI = "mongodb+srv://herokuUser:12345@cluster0.jhaoh.mongodb.net/velocity_db?retryWrites=true&w=majority&appName=Cluster0"
+MONGODB_URI = os.getenv('MONGODB_URI', "mongodb+srv://herokuUser:12345@cluster0.jhaoh.mongodb.net/velocity_db?retryWrites=true&w=majority&appName=Cluster0")
 
 try:
     client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)  # 5 seconds timeout
@@ -59,7 +60,7 @@ except Exception as e:
     true_velocity_collection = None
 
 # Model Configuration
-MODEL_FILENAME = 'model.pkl'
+MODEL_FILENAME = os.getenv('MODEL_FILENAME', 'model.pkl')
 saved_model = None
 
 # If a model was saved before, try loading it
@@ -417,68 +418,68 @@ def process_endpoint():
 
         return jsonify(resp), 200
 
-    @app.route('/predict', methods=['POST'])
-    @csrf.exempt
-    def predict_endpoint():
-        """
-        Only acceleration_file is required.
-        We use the *latest saved model* to predict the average corrected velocity.
-        """
-        global saved_model
-        if 'acceleration_file' not in request.files:
-            logger.warning("Missing acceleration_file in the request.")
-            return jsonify({"error":"Please provide acceleration_file"}), 400
+@app.route('/predict', methods=['POST'])
+@csrf.exempt
+def predict_endpoint():
+    """
+    Only acceleration_file is required.
+    We use the *latest saved model* to predict the average corrected velocity.
+    """
+    global saved_model
+    if 'acceleration_file' not in request.files:
+        logger.warning("Missing acceleration_file in the request.")
+        return jsonify({"error":"Please provide acceleration_file"}), 400
 
-        accel_file = request.files['acceleration_file']
-        if accel_file.filename == '':
-            logger.warning("No selected file for acceleration.")
-            return jsonify({"error":"No selected file"}), 400
+    accel_file = request.files['acceleration_file']
+    if accel_file.filename == '':
+        logger.warning("No selected file for acceleration.")
+        return jsonify({"error":"No selected file"}), 400
 
-        if not allowed_file(accel_file.filename):
-            logger.warning("Uploaded acceleration file is not allowed. Only CSV files are accepted.")
-            return jsonify({"error": "Only CSV files are allowed."}), 400
+    if not allowed_file(accel_file.filename):
+        logger.warning("Uploaded acceleration file is not allowed. Only CSV files are accepted.")
+        return jsonify({"error": "Only CSV files are allowed."}), 400
 
-        try:
-            # If we never loaded or saved a model yet:
-            if not saved_model and os.path.exists(MODEL_FILENAME):
-                try:
-                    saved_model = joblib.load(MODEL_FILENAME)
-                    logger.info(f"Loaded saved model from {MODEL_FILENAME}")
-                except Exception as e:
-                    logger.error(f"Failed to load model from {MODEL_FILENAME}: {str(e)}")
-                    saved_model = None
-            if not saved_model:
-                logger.warning("No saved model found. Please train first.")
-                return jsonify({"error":"No saved model found. Please train first."}), 400
+    try:
+        # If we never loaded or saved a model yet:
+        if not saved_model and os.path.exists(MODEL_FILENAME):
+            try:
+                saved_model = joblib.load(MODEL_FILENAME)
+                logger.info(f"Loaded saved model from {MODEL_FILENAME}")
+            except Exception as e:
+                logger.error(f"Failed to load model from {MODEL_FILENAME}: {str(e)}")
+                saved_model = None
+        if not saved_model:
+            logger.warning("No saved model found. Please train first.")
+            return jsonify({"error":"No saved model found. Please train first."}), 400
 
-            df_accel = pd.read_csv(io.StringIO(accel_file.read().decode("utf-8")), low_memory=False)
-            df_accel.columns = df_accel.columns.str.lower()
+        df_accel = pd.read_csv(io.StringIO(accel_file.read().decode("utf-8")), low_memory=False)
+        df_accel.columns = df_accel.columns.str.lower()
 
-            accel_req = ['ax (m/s^2)','ay (m/s^2)','az (m/s^2)','time']
-            missing_accel = [c for c in accel_req if c not in df_accel.columns]
-            if missing_accel:
-                logger.warning(f"Missing columns in acceleration: {missing_accel}")
-                return jsonify({"error":f"Missing columns in acceleration: {missing_accel}"}), 400
+        accel_req = ['ax (m/s^2)','ay (m/s^2)','az (m/s^2)','time']
+        missing_accel = [c for c in accel_req if c not in df_accel.columns]
+        if missing_accel:
+            logger.warning(f"Missing columns in acceleration: {missing_accel}")
+            return jsonify({"error":f"Missing columns in acceleration: {missing_accel}"}), 400
 
-            # Preprocess
-            df_accel = remove_spikes_and_integrate(df_accel)
-            X_acc = df_accel[['time','velocity']].values
+        # Preprocess
+        df_accel = remove_spikes_and_integrate(df_accel)
+        X_acc = df_accel[['time','velocity']].values
 
-            # Predict
-            predicted_corr = saved_model.predict(X_acc)
-            corrected_vel  = df_accel['velocity'] + predicted_corr
+        # Predict
+        predicted_corr = saved_model.predict(X_acc)
+        corrected_vel  = df_accel['velocity'] + predicted_corr
 
-            avg_corrected_vel = float(corrected_vel.mean())
-            logger.info("Prediction completed successfully.")
+        avg_corrected_vel = float(corrected_vel.mean())
+        logger.info("Prediction completed successfully.")
 
-            return jsonify({
-                "message": "Predicted corrected velocity using the saved model.",
-                "average_corrected_velocity": avg_corrected_vel
-            }), 200
+        return jsonify({
+            "message": "Predicted corrected velocity using the saved model.",
+            "average_corrected_velocity": avg_corrected_vel
+        }), 200
 
-        except Exception as e:
-            logger.exception(f"An error occurred in /predict endpoint: {str(e)}")
-            return jsonify({"error": "An unexpected error occurred during prediction."}), 500
+    except Exception as e:
+        logger.exception(f"An error occurred in /predict endpoint: {str(e)}")
+        return jsonify({"error": "An unexpected error occurred during prediction."}), 500
 
 ################################################################################
 # Basic HTML with Two Forms (Train & Predict)
