@@ -4,6 +4,8 @@ import base64
 import boto3
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')  # Ensure no DISPLAY requirement on Heroku
 import matplotlib.pyplot as plt
 
 from flask import Flask, request, jsonify
@@ -12,29 +14,29 @@ from urllib.parse import urlparse
 from math import sqrt
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-# If needed, from sklearn.model_selection import train_test_split
 
-# -----------------------------
-# Load environment variables
-# -----------------------------
-load_dotenv("variables.env")  # Make sure this file is present.
+# 1) Load environment variables
+# On Heroku, these are set via Config Vars.
+# Locally, you can use a 'variables.env' file if you wish.
+load_dotenv("variables.env")
 
+# 2) Read environment variables
 ACCELERATION_DATA_S3_PATH = os.getenv("ACCELERATION_DATA_S3_PATH")
 VELOCITY_DATA_S3_PATH = os.getenv("VELOCITY_DATA_S3_PATH")
-MASTER_DATASET_S3_PATH = os.getenv("MASTER_DATASET_PATH")  # e.g. s3://yourbucket/MasterDataset/
+MASTER_DATASET_S3_PATH = os.getenv("MASTER_DATASET_PATH")  # e.g. s3://your-bucket/MasterDataset/
 
-# Temporary local paths
+# Temporary local paths (Heroku uses ephemeral file storage, but we just need short-term usage)
 LOCAL_ACCEL_PATH = "/tmp/new_accel_data.csv"
 LOCAL_VELOCITY_PATH = "/tmp/new_velocity_data.csv"
 LOCAL_MASTER_PATH = "/tmp/MasterDataset.csv"
 
 app = Flask(__name__)
 
-# ---------------------------------------------------------
-# Helpers: S3, Parsing, etc.
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
+# Helpers: S3 interactions, etc.
+# -------------------------------------------------------------------
 def parse_s3_path(s3_path):
-    """Parse S3 path into (bucket, prefix)."""
+    """Parse an S3 path 's3://bucket/prefix' into (bucket, prefix)."""
     parsed = urlparse(s3_path)
     if parsed.scheme != 's3':
         raise ValueError(f"Invalid S3 path: {s3_path}")
@@ -43,7 +45,7 @@ def parse_s3_path(s3_path):
     return bucket, prefix
 
 def s3_file_exists(s3_client, bucket, key):
-    """Check if file/key exists in S3."""
+    """Check if a file/key exists in S3."""
     try:
         s3_client.head_object(Bucket=bucket, Key=key)
         return True
@@ -51,46 +53,46 @@ def s3_file_exists(s3_client, bucket, key):
         return False
 
 def download_s3_file(s3_client, bucket, key, local_path):
-    """Download from S3 to local path."""
+    """Download a file from S3 to a local path."""
     s3_client.download_file(bucket, key, local_path)
 
 def upload_s3_file(s3_client, local_path, bucket, key):
-    """Upload local file to S3."""
+    """Upload a file from a local path to S3."""
     s3_client.upload_file(local_path, bucket, key)
 
-# ---------------------------------------------------------
-# Master Dataset Load/Save
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
+# Master Dataset load/save
+# -------------------------------------------------------------------
 def load_master_dataset_from_s3(s3_client, master_s3_path):
-    """
-    Download MasterDataset.csv if it exists; otherwise, return empty DataFrame.
-    """
+    """Load MasterDataset.csv from S3 if it exists, else return empty DataFrame."""
     bucket, prefix = parse_s3_path(master_s3_path)
+    # If user gave only a folder-like path, append 'MasterDataset.csv'
     if prefix.endswith('/'):
         prefix += "MasterDataset.csv"
+
     master_key = prefix
 
     if s3_file_exists(s3_client, bucket, master_key):
         download_s3_file(s3_client, bucket, master_key, LOCAL_MASTER_PATH)
         df_master = pd.read_csv(LOCAL_MASTER_PATH)
     else:
-        df_master = pd.DataFrame(
-            columns=['time','ax','ay','az','true_velocity','dataset_id']
-        )
+        df_master = pd.DataFrame(columns=['time','ax','ay','az','true_velocity','dataset_id'])
+
     return df_master, bucket, master_key
 
 def save_master_dataset_to_s3(s3_client, df_master, bucket, key):
+    """Write df_master to CSV locally, then upload to S3."""
     df_master.to_csv(LOCAL_MASTER_PATH, index=False)
     upload_s3_file(s3_client, LOCAL_MASTER_PATH, bucket, key)
 
-# ---------------------------------------------------------
-# Data Preprocessing
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
+# Preprocessing: from acceleration to velocity
+# -------------------------------------------------------------------
 def preprocess_acceleration_to_velocity(df, time_col='time', ax_col='ax', ay_col='ay', az_col='az'):
-    """Convert acceleration data to velocity with rolling spike smoothing."""
+    """Convert raw acceleration to velocity with basic rolling smoothing of outliers."""
     df = df.sort_values(by=time_col).reset_index(drop=True)
 
-    # Rolling mean & std for dynamic outlier detection
+    # Rolling mean/std for outlier detection
     df['ax_rm'] = df[ax_col].rolling(window=5, center=True).mean()
     df['ay_rm'] = df[ay_col].rolling(window=5, center=True).mean()
     df['az_rm'] = df[az_col].rolling(window=5, center=True).mean()
@@ -100,16 +102,19 @@ def preprocess_acceleration_to_velocity(df, time_col='time', ax_col='ax', ay_col
     df['az_rs'] = df[az_col].rolling(window=5, center=True).std().fillna(0)
 
     std_multiplier = 3
-    for col, rm, rs in zip([ax_col, ay_col, az_col], ['ax_rm','ay_rm','az_rm'], ['ax_rs','ay_rs','az_rs']):
+    for col, rm, rs in zip([ax_col, ay_col, az_col],
+                           ['ax_rm','ay_rm','az_rm'],
+                           ['ax_rs','ay_rs','az_rs']):
         df[col] = np.where(
             abs(df[col] - df[rm]) > std_multiplier * df[rs],
             df[rm],
             df[col]
         )
 
+    # Drop temp columns
     df.drop(columns=['ax_rm','ay_rm','az_rm','ax_rs','ay_rs','az_rs'], inplace=True)
 
-    # Integrate to get velocity
+    # Integrate acceleration to get velocity
     df['time_diff'] = df[time_col].diff().fillna(0)
     velocity = [0.0]
     for i in range(1, len(df)):
@@ -118,7 +123,7 @@ def preprocess_acceleration_to_velocity(df, time_col='time', ax_col='ax', ay_col
         az_i = df.loc[i, az_col]
         dt = df.loc[i, 'time_diff']
 
-        # Choose dominant or magnitude
+        # Use dominant axis or magnitude fallback
         if abs(ax_i) > abs(ay_i) and abs(ax_i) > abs(az_i):
             accel = ax_i
         elif abs(ay_i) > abs(ax_i) and abs(ay_i) > abs(az_i):
@@ -128,13 +133,16 @@ def preprocess_acceleration_to_velocity(df, time_col='time', ax_col='ax', ay_col
         else:
             accel = np.sqrt(ax_i**2 + ay_i**2 + az_i**2)
 
-        velocity.append(velocity[-1] + accel*dt)
+        velocity.append(velocity[-1] + accel * dt)
 
     df['calculated_velocity'] = velocity
     return df
 
 def expand_true_velocity(df_true, df_accel, time_col='time', speed_col='speed'):
-    """Expand velocity data to match row count of acceleration."""
+    """
+    Expand a smaller velocity dataset to match acceleration row count
+    by duplicating/perturbing speed values.
+    """
     if df_true.empty:
         return pd.DataFrame(columns=[time_col, 'true_velocity'])
 
@@ -154,31 +162,34 @@ def expand_true_velocity(df_true, df_accel, time_col='time', speed_col='speed'):
         orig_speed = df_true['true_velocity'].iloc[i]
         expanded_speeds.append(orig_speed)
         for _ in range(ratio_minus_1_int):
-            expanded_speeds.append(np.random.uniform(orig_speed*0.95, orig_speed*1.05))
+            expanded_speeds.append(np.random.uniform(orig_speed * 0.95, orig_speed * 1.05))
 
     remainder = n1 - len(expanded_speeds)
     if remainder > 0:
         last_speed = df_true['true_velocity'].iloc[-1]
         for _ in range(remainder):
-            expanded_speeds.append(np.random.uniform(last_speed*0.95, last_speed*1.05))
+            expanded_speeds.append(np.random.uniform(last_speed * 0.95, last_speed * 1.05))
 
     expanded_speeds = expanded_speeds[:n1]
 
-    df_expanded = pd.DataFrame({
+    return pd.DataFrame({
         time_col: df_accel[time_col].values,
         'true_velocity': expanded_speeds
     })
-    return df_expanded
 
 def create_dataset_id(df_master):
+    """Create a new dataset_id = 1 + max existing."""
     if df_master.empty:
         return 1
     return df_master['dataset_id'].max() + 1
 
 def merge_into_master(df_accel, df_true_expanded, dataset_id):
-    """Combine into a single DF with columns: time, ax, ay, az, true_velocity, dataset_id."""
+    """
+    Merge the acceleration + expanded true velocity into a single DataFrame
+    with columns: [time, ax, ay, az, true_velocity, dataset_id].
+    """
     if 'true_velocity' not in df_true_expanded.columns:
-        # no velocity => all NaN
+        # no velocity => store NaN as placeholders
         df_merged = pd.DataFrame({
             'time': df_accel['time'],
             'ax': df_accel['ax'],
@@ -198,26 +209,28 @@ def merge_into_master(df_accel, df_true_expanded, dataset_id):
         })
     return df_merged
 
-# ---------------------------------------------------------
-# Training
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
+# Training logic
+# -------------------------------------------------------------------
 def train_model_on_master(df_master):
-    """Train on all rows that have real velocity (true_velocity != NaN)."""
+    """Train on all rows that have real (non-NaN) true_velocity."""
     df_trainable = df_master.dropna(subset=['true_velocity']).copy()
     if df_trainable.empty:
         return None  # no data to train on
 
-    # For each dataset_id, recalc "calculated_velocity"
+    # For each dataset_id, recalc "calculated_velocity" so old data is consistent
     dfs = []
     for d_id in df_trainable['dataset_id'].unique():
         subset = df_trainable[df_trainable['dataset_id'] == d_id].copy()
         subset = preprocess_acceleration_to_velocity(subset)
         subset['correction'] = subset['true_velocity'] - subset['calculated_velocity']
         dfs.append(subset)
+
     df_trainable = pd.concat(dfs, ignore_index=True)
 
     X = df_trainable[['time','calculated_velocity']].values
     y = df_trainable['correction'].values
+
     if len(X) < 2:
         return None
 
@@ -226,15 +239,17 @@ def train_model_on_master(df_master):
     return model
 
 def compute_iou_accuracy(y_true, y_pred):
-    """Intersection over Union style: sum(min) / sum(max)."""
+    """Intersection over Union: sum(min) / sum(max) * 100%."""
     min_vals = np.minimum(y_true, y_pred)
     max_vals = np.maximum(y_true, y_pred)
     return (np.sum(min_vals) / np.sum(max_vals)) * 100.0
 
 def repeated_training_until_95(df_master, max_iter=5):
-    """Train multiple times if IoU < 95%, up to max_iter. Return the final model."""
+    """
+    Retrain multiple times if IoU < 95%, up to max_iter.
+    If no real velocity in df_master, train once without IoU checking.
+    """
     if df_master['true_velocity'].dropna().empty:
-        # no ground-truth => can't compute IoU, just train once
         return train_model_on_master(df_master)
 
     model = None
@@ -242,13 +257,13 @@ def repeated_training_until_95(df_master, max_iter=5):
     for i in range(1, max_iter+1):
         model = train_model_on_master(df_master)
         if not model:
-            break  # no model
+            break  # no model could be trained
 
-        # Evaluate IoU on entire master
         df_eval = df_master[~df_master['true_velocity'].isna()].copy()
         if df_eval.empty:
             break
-        # Recalc velocity for each dataset
+
+        # Recalc velocity per dataset, predict corrections
         df_list = []
         for d_id in df_eval['dataset_id'].unique():
             sub = df_eval[df_eval['dataset_id'] == d_id].copy()
@@ -269,25 +284,25 @@ def repeated_training_until_95(df_master, max_iter=5):
 
     return model
 
-# ---------------------------------------------------------
-# Pipeline Functions
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
+# Pipeline for /train
+# -------------------------------------------------------------------
 def run_training_pipeline(accel_path, velocity_path, has_velocity):
     """
-    1) Read & preprocess data
-    2) Merge into Master
-    3) Retrain model
-    4) Return metrics & base64 plot (if velocity is present)
+    - Read & preprocess uploaded acceleration (+ optional velocity).
+    - Merge into Master dataset stored on S3.
+    - Retrain the model using all ground-truth velocity data in Master.
+    - Generate plot + stats for the newly uploaded dataset.
     """
     s3_client = boto3.client('s3')
 
-    # 1) Read Acceleration
+    # 1) Read acceleration
     df_accel = pd.read_csv(accel_path)
     df_accel.columns = df_accel.columns.str.lower()
     required_cols = ['time','ax (m/s^2)','ay (m/s^2)','az (m/s^2)']
     for c in required_cols:
         if c not in df_accel.columns:
-            raise ValueError("Acceleration CSV missing columns: time, ax (m/s^2), ay (m/s^2), az (m/s^2)")
+            raise ValueError("Acceleration CSV missing columns: 'time', 'ax (m/s^2)', 'ay (m/s^2)', 'az (m/s^2)'")
     df_accel = df_accel[required_cols].rename(columns={
         'ax (m/s^2)': 'ax',
         'ay (m/s^2)': 'ay',
@@ -299,48 +314,48 @@ def run_training_pipeline(accel_path, velocity_path, has_velocity):
         df_vel = pd.read_csv(velocity_path)
         df_vel.columns = df_vel.columns.str.lower()
         if 'time' not in df_vel.columns or 'speed' not in df_vel.columns:
-            # treat as no velocity
+            # not a valid velocity file => treat as no velocity
             df_vel = pd.DataFrame()
             has_velocity = False
     else:
         df_vel = pd.DataFrame()
 
-    # expand velocity if present
+    # 3) Expand velocity if present
     df_accel_proc = preprocess_acceleration_to_velocity(df_accel.copy())
     df_vel_expanded = expand_true_velocity(df_vel.copy(), df_accel_proc)
 
-    # 3) Load Master
+    # 4) Load Master from S3
     df_master, master_bucket, master_key = load_master_dataset_from_s3(s3_client, MASTER_DATASET_S3_PATH)
 
-    # 4) Create dataset_id & merge
+    # 5) Merge new dataset => Master
     new_id = create_dataset_id(df_master)
     df_new = merge_into_master(df_accel, df_vel_expanded, new_id)
     df_master = pd.concat([df_master, df_new], ignore_index=True)
     df_master.drop_duplicates(subset=['time','dataset_id'], inplace=True)
 
-    # 5) Save Master
+    # 6) Save Master back to S3
     save_master_dataset_to_s3(s3_client, df_master, master_bucket, master_key)
 
-    # 6) Retrain Model
+    # 7) Retrain model
     model = repeated_training_until_95(df_master, max_iter=5)
     if model is None:
         return {"error": "No valid model trained. Possibly no velocity data in entire master."}
 
-    # 7) Evaluate & Plot for the new dataset only
+    # 8) Evaluate & Plot for new dataset only
     df_new_sorted = df_new.sort_values(by='time').reset_index(drop=True)
     df_new_sorted = preprocess_acceleration_to_velocity(df_new_sorted)
     predicted_corr = model.predict(df_new_sorted[['time','calculated_velocity']].values)
     df_new_sorted['corrected_velocity'] = df_new_sorted['calculated_velocity'] + predicted_corr
 
-    # Prepare results
     results = {}
-    # Make a plot in memory
+
+    # Plot in memory
     plt.figure(figsize=(8, 5))
     plt.plot(df_new_sorted['time'], df_new_sorted['corrected_velocity'], label='Corrected Velocity')
     plt.plot(df_new_sorted['time'], df_new_sorted['calculated_velocity'], label='Calculated Velocity', linestyle='--')
 
+    # If real velocity present, compute stats
     if not df_new_sorted['true_velocity'].isna().all():
-        # we do have real velocity
         valid_mask = ~df_new_sorted['true_velocity'].isna()
         y_true = df_new_sorted.loc[valid_mask, 'true_velocity'].values
         y_pred = df_new_sorted.loc[valid_mask, 'corrected_velocity'].values
@@ -350,13 +365,13 @@ def run_training_pipeline(accel_path, velocity_path, has_velocity):
             mae = mean_absolute_error(y_true, y_pred)
             mse = mean_squared_error(y_true, y_pred)
             rmse = sqrt(mse)
+
             results.update({
                 "iou_accuracy": round(iou, 3),
                 "mae": round(mae, 4),
                 "mse": round(mse, 4),
                 "rmse": round(rmse, 4)
             })
-
         plt.plot(df_new_sorted['time'], df_new_sorted['true_velocity'], label='True Velocity', linestyle=':')
 
     plt.title(f"Velocity Comparison (Dataset ID={new_id})")
@@ -386,15 +401,18 @@ def run_training_pipeline(accel_path, velocity_path, has_velocity):
 
     return results
 
+# -------------------------------------------------------------------
+# Pipeline for /predict (acceleration only)
+# -------------------------------------------------------------------
 def run_prediction_pipeline(accel_path):
     """
-    1) Use existing trained model from Master (if any).
-    2) Predict on new acceleration data only (no velocity).
-    3) Return corrected velocities + base64 plot.
+    - Load any previously trained model from Master (S3).
+    - Predict on new acceleration data only (no velocity).
+    - Return corrected velocities, average velocities, base64 plot.
     """
     s3_client = boto3.client('s3')
 
-    # 1) Load Master & train model (only on those with real velocity)
+    # 1) Load Master & train model (only on real velocity data)
     df_master, master_bucket, master_key = load_master_dataset_from_s3(s3_client, MASTER_DATASET_S3_PATH)
     model = repeated_training_until_95(df_master, max_iter=5)
     if model is None:
@@ -406,7 +424,7 @@ def run_prediction_pipeline(accel_path):
     required_cols = ['time','ax (m/s^2)','ay (m/s^2)','az (m/s^2)']
     for c in required_cols:
         if c not in df_accel.columns:
-            raise ValueError("Acceleration CSV missing columns: time, ax (m/s^2), ay (m/s^2), az (m/s^2)")
+            raise ValueError("Acceleration CSV missing columns: 'time', 'ax (m/s^2)', 'ay (m/s^2)', 'az (m/s^2)'")
     df_accel = df_accel[required_cols].rename(columns={
         'ax (m/s^2)': 'ax',
         'ay (m/s^2)': 'ay',
@@ -417,12 +435,10 @@ def run_prediction_pipeline(accel_path):
     predicted_corr = model.predict(df_accel_proc[['time','calculated_velocity']].values)
     df_accel_proc['corrected_velocity'] = df_accel_proc['calculated_velocity'] + predicted_corr
 
-    # (Optional) If you want to store these predicted rows in Master with true_velocity=NaN, do so:
-    # new_id = create_dataset_id(df_master)
-    # df_new = merge_into_master(df_accel, pd.DataFrame(), new_id)
-    # save_master_dataset_to_s3(...)  # Caution: you might not want to pollute the dataset.
+    # 3) Optionally, store these predicted rows in Master with true_velocity=NaN
+    #    But typically we skip that to avoid polluting the training data with predictions.
 
-    # 3) Plot
+    # 4) Plot
     plt.figure(figsize=(8, 5))
     plt.plot(df_accel_proc['time'], df_accel_proc['corrected_velocity'], label='Corrected Velocity')
     plt.plot(df_accel_proc['time'], df_accel_proc['calculated_velocity'], label='Calculated Velocity', linestyle='--')
@@ -438,26 +454,26 @@ def run_prediction_pipeline(accel_path):
     plot_base64 = base64.b64encode(buf.read()).decode('utf-8')
     plt.close()
 
-    # Return results
     avg_calc = df_accel_proc['calculated_velocity'].mean()
     avg_corr = df_accel_proc['corrected_velocity'].mean()
+
     return {
         "plot_base64": plot_base64,
         "avg_calculated_velocity": round(float(avg_calc), 3),
         "avg_corrected_velocity": round(float(avg_corr), 3)
     }
 
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
 # Flask Routes
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
 @app.route('/train', methods=['POST'])
 def train_endpoint():
     """
     POST /train
     Form-data:
-      accel_csv: the acceleration CSV
-      velocity_csv: the velocity CSV (optional)
-    Returns JSON with metrics + base64 plot
+      accel_csv: acceleration CSV (required)
+      velocity_csv: velocity CSV (optional)
+    Returns JSON with metrics + base64-encoded plot
     """
     accel_file = request.files.get('accel_csv')
     velocity_file = request.files.get('velocity_csv')
@@ -484,7 +500,7 @@ def predict_endpoint():
     """
     POST /predict
     Form-data:
-      accel_csv: the acceleration CSV
+      accel_csv: acceleration CSV (required)
     Returns JSON with predicted velocities + base64 plot
     """
     accel_file = request.files.get('accel_csv')
@@ -500,6 +516,6 @@ def predict_endpoint():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# Uncomment for local debugging:
+# If testing locally, you can uncomment:
 # if __name__ == "__main__":
 #     app.run(host="0.0.0.0", port=5000, debug=True)
