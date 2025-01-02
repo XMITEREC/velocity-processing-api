@@ -5,10 +5,10 @@ import boto3
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use('Agg')  # Use non-GUI backend for Heroku
+matplotlib.use('Agg')  # Ensure no DISPLAY requirement on Heroku
 import matplotlib.pyplot as plt
 
-from flask import Flask, request, jsonify, render_template, redirect, url_for, flash
+from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from urllib.parse import urlparse
 from math import sqrt
@@ -16,20 +16,21 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 # 1) Load environment variables
+# On Heroku, these are set via Config Vars.
+# Locally, you can use a 'variables.env' file if you wish.
 load_dotenv("variables.env")
 
 # 2) Read environment variables
 ACCELERATION_DATA_S3_PATH = os.getenv("ACCELERATION_DATA_S3_PATH")
 VELOCITY_DATA_S3_PATH = os.getenv("VELOCITY_DATA_S3_PATH")
-MASTER_DATASET_S3_PATH = os.getenv("MASTER_DATASET_PATH")  # e.g., s3://your-bucket/MasterDataset/
+MASTER_DATASET_S3_PATH = os.getenv("MASTER_DATASET_PATH")  # e.g. s3://your-bucket/MasterDataset/
 
-# Temporary local paths (Heroku uses ephemeral file storage)
+# Temporary local paths (Heroku uses ephemeral file storage, but we just need short-term usage)
 LOCAL_ACCEL_PATH = "/tmp/new_accel_data.csv"
 LOCAL_VELOCITY_PATH = "/tmp/new_velocity_data.csv"
 LOCAL_MASTER_PATH = "/tmp/MasterDataset.csv"
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24)  # Needed for flash messages
 
 # -------------------------------------------------------------------
 # Helpers: S3 interactions, etc.
@@ -349,7 +350,7 @@ def run_training_pipeline(accel_path, velocity_path, has_velocity):
     results = {}
 
     # Plot in memory
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(8, 5))
     plt.plot(df_new_sorted['time'], df_new_sorted['corrected_velocity'], label='Corrected Velocity')
     plt.plot(df_new_sorted['time'], df_new_sorted['calculated_velocity'], label='Calculated Velocity', linestyle='--')
 
@@ -434,8 +435,11 @@ def run_prediction_pipeline(accel_path):
     predicted_corr = model.predict(df_accel_proc[['time','calculated_velocity']].values)
     df_accel_proc['corrected_velocity'] = df_accel_proc['calculated_velocity'] + predicted_corr
 
-    # 3) Plot
-    plt.figure(figsize=(10, 6))
+    # 3) Optionally, store these predicted rows in Master with true_velocity=NaN
+    #    But typically we skip that to avoid polluting the training data with predictions.
+
+    # 4) Plot
+    plt.figure(figsize=(8, 5))
     plt.plot(df_accel_proc['time'], df_accel_proc['corrected_velocity'], label='Corrected Velocity')
     plt.plot(df_accel_proc['time'], df_accel_proc['calculated_velocity'], label='Calculated Velocity', linestyle='--')
     plt.title("Velocity Prediction (No Ground Truth)")
@@ -462,66 +466,56 @@ def run_prediction_pipeline(accel_path):
 # -------------------------------------------------------------------
 # Flask Routes
 # -------------------------------------------------------------------
-@app.route('/')
-def index():
-    return render_template('index.html')
+@app.route('/train', methods=['POST'])
+def train_endpoint():
+    """
+    POST /train
+    Form-data:
+      accel_csv: acceleration CSV (required)
+      velocity_csv: velocity CSV (optional)
+    Returns JSON with metrics + base64-encoded plot
+    """
+    accel_file = request.files.get('accel_csv')
+    velocity_file = request.files.get('velocity_csv')
 
-@app.route('/train', methods=['GET', 'POST'])
-def train():
-    if request.method == 'POST':
-        accel_file = request.files.get('accel_csv')
-        velocity_file = request.files.get('velocity_csv')
+    if not accel_file:
+        return jsonify({"error": "accel_csv file is required"}), 400
 
-        if not accel_file:
-            flash("Acceleration CSV file is required.", "danger")
-            return redirect(request.url)
+    accel_file.save(LOCAL_ACCEL_PATH)
+    has_velocity = False
+    if velocity_file:
+        velocity_file.save(LOCAL_VELOCITY_PATH)
+        has_velocity = True
 
-        accel_file.save(LOCAL_ACCEL_PATH)
-        has_velocity = False
-        if velocity_file:
-            velocity_file.save(LOCAL_VELOCITY_PATH)
-            has_velocity = True
+    try:
+        results = run_training_pipeline(LOCAL_ACCEL_PATH, LOCAL_VELOCITY_PATH, has_velocity)
+        if "error" in results:
+            return jsonify(results), 500
+        return jsonify(results), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-        try:
-            results = run_training_pipeline(LOCAL_ACCEL_PATH, LOCAL_VELOCITY_PATH, has_velocity)
-            if "error" in results:
-                flash(results["error"], "danger")
-                return redirect(url_for('train'))
-            # Encode plot to display
-            plot_url = f"data:image/png;base64,{results.pop('plot_base64')}"
-            return render_template('result.html', results=results, plot_url=plot_url, action="Train")
-        except Exception as e:
-            flash(f"An error occurred: {str(e)}", "danger")
-            return redirect(url_for('train'))
+@app.route('/predict', methods=['POST'])
+def predict_endpoint():
+    """
+    POST /predict
+    Form-data:
+      accel_csv: acceleration CSV (required)
+    Returns JSON with predicted velocities + base64 plot
+    """
+    accel_file = request.files.get('accel_csv')
+    if not accel_file:
+        return jsonify({"error": "accel_csv file is required"}), 400
 
-    return render_template('train.html')
+    accel_file.save(LOCAL_ACCEL_PATH)
+    try:
+        results = run_prediction_pipeline(LOCAL_ACCEL_PATH)
+        if "error" in results:
+            return jsonify(results), 500
+        return jsonify(results), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-@app.route('/predict', methods=['GET', 'POST'])
-def predict():
-    if request.method == 'POST':
-        accel_file = request.files.get('accel_csv')
-
-        if not accel_file:
-            flash("Acceleration CSV file is required.", "danger")
-            return redirect(request.url)
-
-        accel_file.save(LOCAL_ACCEL_PATH)
-
-        try:
-            results = run_prediction_pipeline(LOCAL_ACCEL_PATH)
-            if "error" in results:
-                flash(results["error"], "danger")
-                return redirect(url_for('predict'))
-            # Encode plot to display
-            plot_url = f"data:image/png;base64,{results.pop('plot_base64')}"
-            return render_template('result.html', results=results, plot_url=plot_url, action="Predict")
-        except Exception as e:
-            flash(f"An error occurred: {str(e)}", "danger")
-            return redirect(url_for('predict'))
-
-    return render_template('predict.html')
-
-# If testing locally, uncomment the following:
+# If testing locally, you can uncomment:
 # if __name__ == "__main__":
 #     app.run(host="0.0.0.0", port=5000, debug=True)
-v
