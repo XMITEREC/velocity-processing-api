@@ -5,10 +5,10 @@ import boto3
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use('Agg')  # Ensure no DISPLAY requirement on Heroku
+matplotlib.use('Agg')  # Use non-GUI backend for Heroku
 import matplotlib.pyplot as plt
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template, redirect, url_for, flash
 from dotenv import load_dotenv
 from urllib.parse import urlparse
 from math import sqrt
@@ -16,21 +16,20 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 # 1) Load environment variables
-# On Heroku, these are set via Config Vars.
-# Locally, you can use a 'variables.env' file if you wish.
 load_dotenv("variables.env")
 
 # 2) Read environment variables
 ACCELERATION_DATA_S3_PATH = os.getenv("ACCELERATION_DATA_S3_PATH")
 VELOCITY_DATA_S3_PATH = os.getenv("VELOCITY_DATA_S3_PATH")
-MASTER_DATASET_S3_PATH = os.getenv("MASTER_DATASET_PATH")  # e.g. s3://your-bucket/MasterDataset/
+MASTER_DATASET_S3_PATH = os.getenv("MASTER_DATASET_PATH")  # e.g., s3://your-bucket/MasterDataset/
 
-# Temporary local paths (Heroku uses ephemeral file storage, but we just need short-term usage)
+# Temporary local paths (Heroku uses ephemeral file storage)
 LOCAL_ACCEL_PATH = "/tmp/new_accel_data.csv"
 LOCAL_VELOCITY_PATH = "/tmp/new_velocity_data.csv"
 LOCAL_MASTER_PATH = "/tmp/MasterDataset.csv"
 
 app = Flask(__name__)
+app.secret_key = os.urandom(24)  # Needed for flash messages
 
 # -------------------------------------------------------------------
 # Helpers: S3 interactions, etc.
@@ -350,7 +349,7 @@ def run_training_pipeline(accel_path, velocity_path, has_velocity):
     results = {}
 
     # Plot in memory
-    plt.figure(figsize=(8, 5))
+    plt.figure(figsize=(10, 6))
     plt.plot(df_new_sorted['time'], df_new_sorted['corrected_velocity'], label='Corrected Velocity')
     plt.plot(df_new_sorted['time'], df_new_sorted['calculated_velocity'], label='Calculated Velocity', linestyle='--')
 
@@ -435,11 +434,8 @@ def run_prediction_pipeline(accel_path):
     predicted_corr = model.predict(df_accel_proc[['time','calculated_velocity']].values)
     df_accel_proc['corrected_velocity'] = df_accel_proc['calculated_velocity'] + predicted_corr
 
-    # 3) Optionally, store these predicted rows in Master with true_velocity=NaN
-    #    But typically we skip that to avoid polluting the training data with predictions.
-
-    # 4) Plot
-    plt.figure(figsize=(8, 5))
+    # 3) Plot
+    plt.figure(figsize=(10, 6))
     plt.plot(df_accel_proc['time'], df_accel_proc['corrected_velocity'], label='Corrected Velocity')
     plt.plot(df_accel_proc['time'], df_accel_proc['calculated_velocity'], label='Calculated Velocity', linestyle='--')
     plt.title("Velocity Prediction (No Ground Truth)")
@@ -528,3 +524,4 @@ def predict():
 # If testing locally, uncomment the following:
 # if __name__ == "__main__":
 #     app.run(host="0.0.0.0", port=5000, debug=True)
+v
