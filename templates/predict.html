@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+
+{% block content %}
+<h2>Predict Velocity</h2>
+<form method="POST" enctype="multipart/form-data">
+    <div class="mb-3">
+        <label for="accel_csv" class="form-label">Acceleration CSV File<span class="text-danger">*</span></label>
+        <input class="form-control" type="file" id="accel_csv" name="accel_csv" accept=".csv" required>
+    </div>
+    <button type="submit" class="btn btn-success">Predict Velocity</button>
+</form>
+{% endblock %}

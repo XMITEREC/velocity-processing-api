@@ -466,56 +466,65 @@ def run_prediction_pipeline(accel_path):
 # -------------------------------------------------------------------
 # Flask Routes
 # -------------------------------------------------------------------
-@app.route('/train', methods=['POST'])
-def train_endpoint():
-    """
-    POST /train
-    Form-data:
-      accel_csv: acceleration CSV (required)
-      velocity_csv: velocity CSV (optional)
-    Returns JSON with metrics + base64-encoded plot
-    """
-    accel_file = request.files.get('accel_csv')
-    velocity_file = request.files.get('velocity_csv')
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-    if not accel_file:
-        return jsonify({"error": "accel_csv file is required"}), 400
+@app.route('/train', methods=['GET', 'POST'])
+def train():
+    if request.method == 'POST':
+        accel_file = request.files.get('accel_csv')
+        velocity_file = request.files.get('velocity_csv')
 
-    accel_file.save(LOCAL_ACCEL_PATH)
-    has_velocity = False
-    if velocity_file:
-        velocity_file.save(LOCAL_VELOCITY_PATH)
-        has_velocity = True
+        if not accel_file:
+            flash("Acceleration CSV file is required.", "danger")
+            return redirect(request.url)
 
-    try:
-        results = run_training_pipeline(LOCAL_ACCEL_PATH, LOCAL_VELOCITY_PATH, has_velocity)
-        if "error" in results:
-            return jsonify(results), 500
-        return jsonify(results), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        accel_file.save(LOCAL_ACCEL_PATH)
+        has_velocity = False
+        if velocity_file:
+            velocity_file.save(LOCAL_VELOCITY_PATH)
+            has_velocity = True
 
-@app.route('/predict', methods=['POST'])
-def predict_endpoint():
-    """
-    POST /predict
-    Form-data:
-      accel_csv: acceleration CSV (required)
-    Returns JSON with predicted velocities + base64 plot
-    """
-    accel_file = request.files.get('accel_csv')
-    if not accel_file:
-        return jsonify({"error": "accel_csv file is required"}), 400
+        try:
+            results = run_training_pipeline(LOCAL_ACCEL_PATH, LOCAL_VELOCITY_PATH, has_velocity)
+            if "error" in results:
+                flash(results["error"], "danger")
+                return redirect(url_for('train'))
+            # Encode plot to display
+            plot_url = f"data:image/png;base64,{results.pop('plot_base64')}"
+            return render_template('result.html', results=results, plot_url=plot_url, action="Train")
+        except Exception as e:
+            flash(f"An error occurred: {str(e)}", "danger")
+            return redirect(url_for('train'))
 
-    accel_file.save(LOCAL_ACCEL_PATH)
-    try:
-        results = run_prediction_pipeline(LOCAL_ACCEL_PATH)
-        if "error" in results:
-            return jsonify(results), 500
-        return jsonify(results), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    return render_template('train.html')
 
-# If testing locally, you can uncomment:
+@app.route('/predict', methods=['GET', 'POST'])
+def predict():
+    if request.method == 'POST':
+        accel_file = request.files.get('accel_csv')
+
+        if not accel_file:
+            flash("Acceleration CSV file is required.", "danger")
+            return redirect(request.url)
+
+        accel_file.save(LOCAL_ACCEL_PATH)
+
+        try:
+            results = run_prediction_pipeline(LOCAL_ACCEL_PATH)
+            if "error" in results:
+                flash(results["error"], "danger")
+                return redirect(url_for('predict'))
+            # Encode plot to display
+            plot_url = f"data:image/png;base64,{results.pop('plot_base64')}"
+            return render_template('result.html', results=results, plot_url=plot_url, action="Predict")
+        except Exception as e:
+            flash(f"An error occurred: {str(e)}", "danger")
+            return redirect(url_for('predict'))
+
+    return render_template('predict.html')
+
+# If testing locally, uncomment the following:
 # if __name__ == "__main__":
 #     app.run(host="0.0.0.0", port=5000, debug=True)

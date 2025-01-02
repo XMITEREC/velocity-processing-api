@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+
+{% block content %}
+<h2>Train the Model</h2>
+<form method="POST" enctype="multipart/form-data">
+    <div class="mb-3">
+        <label for="accel_csv" class="form-label">Acceleration CSV File<span class="text-danger">*</span></label>
+        <input class="form-control" type="file" id="accel_csv" name="accel_csv" accept=".csv" required>
+    </div>
+    <div class="mb-3">
+        <label for="velocity_csv" class="form-label">Velocity CSV File (Optional)</label>
+        <input class="form-control" type="file" id="velocity_csv" name="velocity_csv" accept=".csv">
+    </div>
+    <button type="submit" class="btn btn-primary">Train Model</button>
+</form>
+{% endblock %}
