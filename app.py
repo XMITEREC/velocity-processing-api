@@ -9,9 +9,8 @@ import matplotlib.pyplot as plt
 
 from flask import Flask, request, jsonify, render_template_string
 from pymongo import MongoClient
-from bson.objectid import ObjectId
 from werkzeug.utils import secure_filename
-from math import sqrt
+from bson.objectid import ObjectId
 import joblib
 import logging
 
@@ -31,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 # Initialize Flask App
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'you-should-change-this')
+app.config['SECRET_KEY'] = 'a_secure_random_secret_key'  # Replace with a secure key in production
 
 # Initialize CSRF Protection
 csrf = CSRFProtect(app)
@@ -44,18 +43,14 @@ def allowed_file(filename):
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 # Initialize MongoDB Client
-MONGODB_URI = os.getenv('MONGODB_URI')
-if not MONGODB_URI:
-    logger.error("No MongoDB URI provided. Please set the MONGODB_URI environment variable.")
-    raise ValueError("No MongoDB URI provided. Please set the MONGODB_URI environment variable.")
-
+MONGODB_URI = "mongodb+srv://herokuUser:12345@cluster0.jhaoh.mongodb.net/velocity_db?retryWrites=true&w=majority&appName=Cluster0"
 client = MongoClient(MONGODB_URI)
 db = client['velocity_db']
 accel_collection = db['acceleration_data']
 true_velocity_collection = db['true_velocity_data']
 
 # Model Configuration
-MODEL_FILENAME = os.getenv('MODEL_FILENAME', 'model.pkl')
+MODEL_FILENAME = 'model.pkl'
 saved_model = None
 
 # If a model was saved before, try loading it
