@@ -1,3 +1,5 @@
+# app.py
+
 import os
 import io
 import base64
@@ -664,7 +666,30 @@ def index():
     """
 
 ################################################################################
-# 8) APPLICATION ENTRY POINT
+# 8) HANDLE /favicon.ico REQUESTS
+################################################################################
+
+@app.route('/favicon.ico')
+def favicon():
+    """
+    Handle favicon.ico requests to prevent 404 errors and application crashes.
+    Returns a 204 No Content response.
+    """
+    return '', 204
+
+################################################################################
+# 9) HANDLE UNKNOWN ROUTES
+################################################################################
+
+@app.errorhandler(404)
+def page_not_found(e):
+    """
+    Handle 404 errors gracefully without crashing the application.
+    """
+    return jsonify({"error": "Resource not found."}), 404
+
+################################################################################
+# 10) APPLICATION ENTRY POINT
 ################################################################################
 
 if __name__ == '__main__':
