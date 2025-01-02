@@ -5,10 +5,10 @@ import boto3
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use('Agg')  # Ensure no DISPLAY requirement on Heroku
+matplotlib.use('Agg')  # Use non-GUI backend for Heroku
 import matplotlib.pyplot as plt
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for, flash
 from dotenv import load_dotenv
 from urllib.parse import urlparse
 from math import sqrt
@@ -16,21 +16,20 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 # 1) Load environment variables
-# On Heroku, these are set via Config Vars.
-# Locally, you can use a 'variables.env' file if you wish.
 load_dotenv("variables.env")
 
 # 2) Read environment variables
 ACCELERATION_DATA_S3_PATH = os.getenv("ACCELERATION_DATA_S3_PATH")
 VELOCITY_DATA_S3_PATH = os.getenv("VELOCITY_DATA_S3_PATH")
-MASTER_DATASET_S3_PATH = os.getenv("MASTER_DATASET_PATH")  # e.g. s3://your-bucket/MasterDataset/
+MASTER_DATASET_S3_PATH = os.getenv("MASTER_DATASET_PATH")  # e.g., s3://your-bucket/MasterDataset/
 
-# Temporary local paths (Heroku uses ephemeral file storage, but we just need short-term usage)
+# Temporary local paths (Heroku uses ephemeral file storage)
 LOCAL_ACCEL_PATH = "/tmp/new_accel_data.csv"
 LOCAL_VELOCITY_PATH = "/tmp/new_velocity_data.csv"
 LOCAL_MASTER_PATH = "/tmp/MasterDataset.csv"
 
 app = Flask(__name__)
+app.secret_key = os.urandom(24)  # Needed for flash messages
 
 # -------------------------------------------------------------------
 # Helpers: S3 interactions, etc.
@@ -350,7 +349,7 @@ def run_training_pipeline(accel_path, velocity_path, has_velocity):
     results = {}
 
     # Plot in memory
-    plt.figure(figsize=(8, 5))
+    plt.figure(figsize=(10, 6))
     plt.plot(df_new_sorted['time'], df_new_sorted['corrected_velocity'], label='Corrected Velocity')
     plt.plot(df_new_sorted['time'], df_new_sorted['calculated_velocity'], label='Calculated Velocity', linestyle='--')
 
@@ -435,11 +434,8 @@ def run_prediction_pipeline(accel_path):
     predicted_corr = model.predict(df_accel_proc[['time','calculated_velocity']].values)
     df_accel_proc['corrected_velocity'] = df_accel_proc['calculated_velocity'] + predicted_corr
 
-    # 3) Optionally, store these predicted rows in Master with true_velocity=NaN
-    #    But typically we skip that to avoid polluting the training data with predictions.
-
-    # 4) Plot
-    plt.figure(figsize=(8, 5))
+    # 3) Plot
+    plt.figure(figsize=(10, 6))
     plt.plot(df_accel_proc['time'], df_accel_proc['corrected_velocity'], label='Corrected Velocity')
     plt.plot(df_accel_proc['time'], df_accel_proc['calculated_velocity'], label='Calculated Velocity', linestyle='--')
     plt.title("Velocity Prediction (No Ground Truth)")
@@ -464,58 +460,232 @@ def run_prediction_pipeline(accel_path):
     }
 
 # -------------------------------------------------------------------
-# Flask Routes
+# Flask Routes with Embedded HTML
 # -------------------------------------------------------------------
-@app.route('/train', methods=['POST'])
-def train_endpoint():
-    """
-    POST /train
-    Form-data:
-      accel_csv: acceleration CSV (required)
-      velocity_csv: velocity CSV (optional)
-    Returns JSON with metrics + base64-encoded plot
-    """
-    accel_file = request.files.get('accel_csv')
-    velocity_file = request.files.get('velocity_csv')
 
-    if not accel_file:
-        return jsonify({"error": "accel_csv file is required"}), 400
+# HTML Templates as strings
+base_html = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Velocity Predictor</title>
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            background-color: #f8f9fa;
+        }
+        h2 {
+            margin-bottom: 20px;
+        }
+        .jumbotron {
+            padding: 2rem 1rem;
+        }
+    </style>
+</head>
+<body>
+    <!-- Navigation Bar -->
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4">
+      <div class="container-fluid">
+        <a class="navbar-brand" href="/">Velocity Predictor</a>
+        <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav" 
+                aria-controls="navbarNav" aria-expanded="false" aria-label="Toggle navigation">
+          <span class="navbar-toggler-icon"></span>
+        </button>
+        <div class="collapse navbar-collapse" id="navbarNav">
+          <ul class="navbar-nav ms-auto">
+            <li class="nav-item">
+              <a class="nav-link" href="/train">Train Model</a>
+            </li>
+            <li class="nav-item">
+              <a class="nav-link" href="/predict">Predict Velocity</a>
+            </li>
+          </ul>
+        </div>
+      </div>
+    </nav>
 
-    accel_file.save(LOCAL_ACCEL_PATH)
-    has_velocity = False
-    if velocity_file:
-        velocity_file.save(LOCAL_VELOCITY_PATH)
-        has_velocity = True
+    <!-- Flash Messages -->
+    <div class="container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            {% for category, message in messages %}
+              <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+                {{ message }}
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+              </div>
+            {% endfor %}
+          {% endif %}
+        {% endwith %}
+    </div>
 
-    try:
-        results = run_training_pipeline(LOCAL_ACCEL_PATH, LOCAL_VELOCITY_PATH, has_velocity)
-        if "error" in results:
-            return jsonify(results), 500
-        return jsonify(results), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    <!-- Main Content -->
+    <div class="container">
+        {% block content %}{% endblock %}
+    </div>
 
-@app.route('/predict', methods=['POST'])
-def predict_endpoint():
-    """
-    POST /predict
-    Form-data:
-      accel_csv: acceleration CSV (required)
-    Returns JSON with predicted velocities + base64 plot
-    """
-    accel_file = request.files.get('accel_csv')
-    if not accel_file:
-        return jsonify({"error": "accel_csv file is required"}), 400
+    <!-- Bootstrap JS (with Popper) -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+"""
 
-    accel_file.save(LOCAL_ACCEL_PATH)
-    try:
-        results = run_prediction_pipeline(LOCAL_ACCEL_PATH)
-        if "error" in results:
-            return jsonify(results), 500
-        return jsonify(results), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+index_html = """
+{% extends "base.html" %}
 
-# If testing locally, you can uncomment:
+{% block content %}
+<div class="jumbotron text-center">
+    <h1 class="display-4">Welcome to Velocity Predictor</h1>
+    <p class="lead">Upload your datasets to train the model or predict velocities based on acceleration data.</p>
+    <hr class="my-4">
+    <a class="btn btn-primary btn-lg me-2" href="/train" role="button">Train Model</a>
+    <a class="btn btn-success btn-lg" href="/predict" role="button">Predict Velocity</a>
+</div>
+{% endblock %}
+"""
+
+train_html = """
+{% extends "base.html" %}
+
+{% block content %}
+<h2>Train the Model</h2>
+<form method="POST" enctype="multipart/form-data">
+    <div class="mb-3">
+        <label for="accel_csv" class="form-label">Acceleration CSV File<span class="text-danger">*</span></label>
+        <input class="form-control" type="file" id="accel_csv" name="accel_csv" accept=".csv" required>
+    </div>
+    <div class="mb-3">
+        <label for="velocity_csv" class="form-label">Velocity CSV File (Optional)</label>
+        <input class="form-control" type="file" id="velocity_csv" name="velocity_csv" accept=".csv">
+    </div>
+    <button type="submit" class="btn btn-primary">Train Model</button>
+</form>
+{% endblock %}
+"""
+
+predict_html = """
+{% extends "base.html" %}
+
+{% block content %}
+<h2>Predict Velocity</h2>
+<form method="POST" enctype="multipart/form-data">
+    <div class="mb-3">
+        <label for="accel_csv" class="form-label">Acceleration CSV File<span class="text-danger">*</span></label>
+        <input class="form-control" type="file" id="accel_csv" name="accel_csv" accept=".csv" required>
+    </div>
+    <button type="submit" class="btn btn-success">Predict Velocity</button>
+</form>
+{% endblock %}
+"""
+
+result_html = """
+{% extends "base.html" %}
+
+{% block content %}
+<h2>{{ action }} Results</h2>
+
+{% if results %}
+    <div class="mb-4">
+        {% for key, value in results.items() %}
+            {% if key != 'plot_base64' %}
+                <p><strong>{{ key.replace('_', ' ').capitalize() }}:</strong> {{ value }}</p>
+            {% endif %}
+        {% endfor %}
+    </div>
+    <div class="mb-4">
+        <img src="{{ plot_url }}" alt="Plot" class="img-fluid">
+    </div>
+    <a href="/" class="btn btn-secondary">Back to Home</a>
+    <a href="/{{ action|lower }}" class="btn btn-primary">Perform Another {{ action }}</a>
+{% else %}
+    <p>No results to display.</p>
+{% endif %}
+{% endblock %}
+"""
+
+# Registering the templates
+templates = {
+    "base.html": base_html,
+    "index.html": index_html,
+    "train.html": train_html,
+    "predict.html": predict_html,
+    "result.html": result_html
+}
+
+@app.route('/')
+def index():
+    return render_template_string(templates["index.html"], templates=templates)
+
+@app.route('/train', methods=['GET', 'POST'])
+def train():
+    if request.method == 'POST':
+        accel_file = request.files.get('accel_csv')
+        velocity_file = request.files.get('velocity_csv')
+
+        if not accel_file:
+            flash("Acceleration CSV file is required.", "danger")
+            return redirect(request.url)
+
+        try:
+            accel_file.save(LOCAL_ACCEL_PATH)
+            has_velocity = False
+            if velocity_file:
+                velocity_file.save(LOCAL_VELOCITY_PATH)
+                has_velocity = True
+
+            results = run_training_pipeline(LOCAL_ACCEL_PATH, LOCAL_VELOCITY_PATH, has_velocity)
+
+            if "error" in results:
+                flash(results["error"], "danger")
+                return redirect(url_for('train'))
+
+            # Encode plot to display
+            plot_url = f"data:image/png;base64,{results.pop('plot_base64')}"
+            return render_template_string(templates["result.html"], results=results, plot_url=plot_url, action="Train")
+        except Exception as e:
+            flash(f"An error occurred during training: {str(e)}", "danger")
+            return redirect(url_for('train'))
+
+    return render_template_string(templates["train.html"], templates=templates)
+
+@app.route('/predict', methods=['GET', 'POST'])
+def predict():
+    if request.method == 'POST':
+        accel_file = request.files.get('accel_csv')
+
+        if not accel_file:
+            flash("Acceleration CSV file is required.", "danger")
+            return redirect(request.url)
+
+        try:
+            accel_file.save(LOCAL_ACCEL_PATH)
+            results = run_prediction_pipeline(LOCAL_ACCEL_PATH)
+
+            if "error" in results:
+                flash(results["error"], "danger")
+                return redirect(url_for('predict'))
+
+            # Encode plot to display
+            plot_url = f"data:image/png;base64,{results.pop('plot_base64')}"
+            return render_template_string(templates["result.html"], results=results, plot_url=plot_url, action="Predict")
+        except Exception as e:
+            flash(f"An error occurred during prediction: {str(e)}", "danger")
+            return redirect(url_for('predict'))
+
+    return render_template_string(templates["predict.html"], templates=templates)
+
+# -------------------------------------------------------------------
+# Health Check Route (Optional)
+# -------------------------------------------------------------------
+@app.route('/health')
+def health():
+    return "OK", 200
+
+# -------------------------------------------------------------------
+# Run the app
+# -------------------------------------------------------------------
+# Uncomment the following lines to run locally for testing
 # if __name__ == "__main__":
 #     app.run(host="0.0.0.0", port=5000, debug=True)
